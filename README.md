@@ -1,119 +1,350 @@
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/activating-more-pixels-in-image-super/image-super-resolution-on-set5-4x-upscaling)](https://paperswithcode.com/sota/image-super-resolution-on-set5-4x-upscaling?p=activating-more-pixels-in-image-super)
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/activating-more-pixels-in-image-super/image-super-resolution-on-urban100-4x)](https://paperswithcode.com/sota/image-super-resolution-on-urban100-4x?p=activating-more-pixels-in-image-super)
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/activating-more-pixels-in-image-super/image-super-resolution-on-set14-4x-upscaling)](https://paperswithcode.com/sota/image-super-resolution-on-set14-4x-upscaling?p=activating-more-pixels-in-image-super)
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/activating-more-pixels-in-image-super/image-super-resolution-on-manga109-4x)](https://paperswithcode.com/sota/image-super-resolution-on-manga109-4x?p=activating-more-pixels-in-image-super)
+# HAT + Knowledge Distillation SR Pipeline
 
-# HAT [![Replicate](https://replicate.com/cjwbw/hat/badge)](https://replicate.com/cjwbw/hat)
+A **turn-key Knowledge Distillation (KD) Super-Resolution** framework built on top of [HAT](https://github.com/XPixelGroup/HAT) (BasicSR).
 
-### Activating More Pixels in Image Super-Resolution Transformer [[Paper Link]](https://arxiv.org/abs/2205.04437)
-[Xiangyu Chen](https://chxy95.github.io/), [Xintao Wang](https://xinntao.github.io/), [Jiantao Zhou](https://www.fst.um.edu.mo/personal/jtzhou/), [Yu Qiao](https://scholar.google.com.hk/citations?user=gFtI-8QAAAAJ) and [Chao Dong](https://scholar.google.com.hk/citations?user=OSDCB0UAAAAJ&hl=zh-CN)
+- **Teacher**: HAT *or* MambaIRv2 – large, frozen transformer model
+- **Student**: RepSR – lightweight RepVGG-based model with structural reparameterization
+- **KD method**: FitNet (feature-level MSE) + output-level L1 against teacher pseudo-GT
+- **Extras**: optional Space-to-Depth pre-processing, tiling for GPU-memory-limited inference
 
-### HAT: Hybrid Attention Transformer for Image Restoration [[Paper Link]](https://arxiv.org/abs/2309.05239)
-[Xiangyu Chen](https://chxy95.github.io/), [Xintao Wang](https://xinntao.github.io/), [Wenlong Zhang](https://wenlongzhang0517.github.io/), [Xiangtao Kong](https://xiangtaokong.github.io/), [Jiantao Zhou](https://www.fst.um.edu.mo/personal/jtzhou/), [Yu Qiao](https://scholar.google.com.hk/citations?user=gFtI-8QAAAAJ) and [Chao Dong](https://scholar.google.com.hk/citations?user=OSDCB0UAAAAJ&hl=zh-CN)
+---
 
-## Updates
-- ✅ 2022-05-09: Release the first version of the paper at Arxiv.
-- ✅ 2022-05-20: Release the codes, models and results of HAT.
-- ✅ 2022-08-29: Add a Replicate demo for SRx4.
-- ✅ 2022-09-25: Add the tile mode for inference with limited GPU memory.
-- ✅ 2022-11-24: Upload a GAN-based HAT model for **Real-World SR** (Real_HAT_GAN_SRx4.pth). 
-- ✅ 2023-03-19: Update paper to CVPR version. Small HAT models are added.
-- ✅ 2023-04-05: Upload the HAT-S codes, models and results. 
-- ✅ 2023-08-01: Upload another GAN model for sharper results (Real_HAT_GAN_SRx4_sharper.pth). 
-- ✅ 2023-08-01: Upload the training configs for the **Real-World GAN-based model**.
-- ✅ 2023-09-11: Release the extended version of the paper at [Arxiv](https://arxiv.org/abs/2309.05239).
-- **(To do)** Add the tile mode for Replicate demo. 
-- **(To do)** Update the Replicate demo for Real-World SR. 
-- **(To do)** Add HAT models for Multiple Image Restoration tasks. 
+## Table of Contents
 
-## Overview
-<img src="https://raw.githubusercontent.com/chxy95/HAT/master/figures/Performance_comparison.png" width="600"/>
+1. [Environment Setup](#1-environment-setup)
+2. [Dataset & Directory Layout](#2-dataset--directory-layout)
+3. [YAML Option Reference](#3-yaml-option-reference)
+4. [KD Training](#4-kd-training)
+5. [Convert to Deployment Weights](#5-convert-to-deployment-weights)
+6. [Final Inference / Test](#6-final-inference--test)
+7. [Architecture Notes](#7-architecture-notes)
 
-**Benchmark results on SRx4 without ImageNet pretraining. Mulit-Adds are calculated for a 64x64 input.**
-| Model | Params(M) | Multi-Adds(G) | Set5 | Set14 | BSD100 | Urban100 | Manga109 |
-|-------|:---------:|:---------:|:---------:|:---------:|:---------:|:---------:|:---------:|
-| [SwinIR](https://github.com/JingyunLiang/SwinIR) |   11.9    | 53.6 | 32.92 | 29.09 | 27.92 | 27.45 | 32.03 |
-| HAT-S |   9.6    | 54.9 | 32.92 | 29.15 | 27.97 | 27.87 | 32.35 |
-| HAT |   20.8    | 102.4 | 33.04 | 29.23 | 28.00 | 27.97 | 32.48 |
+---
 
-## Real-World SR Results
-**Note that:**
-- The default settings in the training configs (almost the same as Real-ESRGAN) are for training **Real_HAT_GAN_SRx4_sharper**.
-- **Real_HAT_GAN_SRx4** is trained using similar settings without USM the ground truth.
-- **Real_HAT_GAN_SRx4** would have better fidelity.
-- **Real_HAT_GAN_SRx4_sharper** would have better perceptual quality.
+## 1. Environment Setup
 
-**Results produced by** Real_HAT_GAN_SRx4_sharper.pth.
-
-<img src="https://raw.githubusercontent.com/chxy95/HAT/master/figures/Visual_Results.png" width="800"/>
-
-**Comparison with the state-of-the-art Real-SR methods.**
-
-<img src="https://raw.githubusercontent.com/chxy95/HAT/master/figures/Comparison.png" width="800"/>
-
-## Citations
-#### BibTeX
-
-    @InProceedings{chen2023activating,
-        author    = {Chen, Xiangyu and Wang, Xintao and Zhou, Jiantao and Qiao, Yu and Dong, Chao},
-        title     = {Activating More Pixels in Image Super-Resolution Transformer},
-        booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-        month     = {June},
-        year      = {2023},
-        pages     = {22367-22377}
-    }
-
-    @article{chen2023hat,
-      title={HAT: Hybrid Attention Transformer for Image Restoration},
-      author={Chen, Xiangyu and Wang, Xintao and Zhang, Wenlong and Kong, Xiangtao and Qiao, Yu and Zhou, Jiantao and Dong, Chao},
-      journal={arXiv preprint arXiv:2309.05239},
-      year={2023}
-    }
-
-## Environment
-- [PyTorch >= 1.7](https://pytorch.org/) **(Recommend **NOT** using torch 1.8!!! It would cause abnormal performance.)**
-- [BasicSR == 1.3.4.9](https://github.com/XPixelGroup/BasicSR/blob/master/INSTALL.md) 
-### Installation
-Install Pytorch first.
-Then,
-```
+```bash
+# 1-a. Clone & install HAT dependencies
+git clone https://github.com/XPixelGroup/HAT.git
+cd HAT
 pip install -r requirements.txt
+pip install basicsr
+
+# 1-b. Install HAT as editable package
 python setup.py develop
+
+# 1-c. (Optional) MambaIRv2 teacher requires extra packages
+pip install mamba-ssm einops
+# Note: mamba-ssm needs a CUDA-capable GPU and matching CUDA toolkit.
+# Skip this if you are only using the HAT teacher.
 ```
 
-## How To Test
+---
 
-Without implementing the codes, [chaiNNer](https://github.com/chaiNNer-org/chaiNNer) is a nice tool to run our models.
+## 2. Dataset & Directory Layout
 
-Otherwise, 
-- Refer to `./options/test` for the configuration file of the model to be tested, and prepare the testing data and pretrained model.  
-- The pretrained models are available at
-[Google Drive](https://drive.google.com/drive/folders/1HpmReFfoUqUbnAOQ7rvOeNU3uf_m69w0?usp=sharing) or [Baidu Netdisk](https://pan.baidu.com/s/1u2r4Lc2_EEeQqra2-w85Xg) (access code: qyrl).  
-- Then run the following codes (taking `HAT_SRx4_ImageNet-pretrain.pth` as an example):
+### Recommended directory structure
+
 ```
-python hat/test.py -opt options/test/HAT_SRx4_ImageNet-pretrain.yml
+HAT/
+├── datasets/
+│   ├── DF2K/
+│   │   ├── DF2K_HR_sub/          # HR sub-images (800x800 -> 480x480 patches)
+│   │   └── DF2K_bicx4_sub/       # LR sub-images (bicubic x4 downsampled)
+│   ├── Set5/
+│   │   ├── GTmod4/               # HR ground-truth
+│   │   └── LRbicx4/              # LR bicubic inputs
+│   └── Set14/
+│       ├── GTmod4/
+│       └── LRbicx4/
+└── experiments/
+    └── pretrained_models/
+        └── HAT_SRx4_ImageNet-pretrain.pth   # teacher checkpoint
 ```
-The testing results will be saved in the `./results` folder.  
 
-- Refer to `./options/test/HAT_SRx4_ImageNet-LR.yml` for **inference** without the ground truth image.
+### Generating DF2K sub-images (if not already done)
 
-**Note that the tile mode is also provided for limited GPU memory when testing. You can modify the specific settings of the tile mode in your custom testing option by referring to `./options/test/HAT_tile_example.yml`.**
+```bash
+# Generate HR sub-images (stride 240, size 480)
+python basicsr/scripts/extract_subimages.py \
+    --input  datasets/DF2K/DF2K_HR \
+    --output datasets/DF2K/DF2K_HR_sub \
+    --n_thread 20
 
-## How To Train
-- Refer to `./options/train` for the configuration file of the model to train.
-- Preparation of training data can refer to [this page](https://github.com/XPixelGroup/BasicSR/blob/master/docs/DatasetPreparation.md). ImageNet dataset can be downloaded at the [official website](https://image-net.org/challenges/LSVRC/2012/2012-downloads.php).
-- The training command is like
+# Generate LR sub-images
+python basicsr/scripts/extract_subimages.py \
+    --input  datasets/DF2K/DF2K_LR_bicubic/X4 \
+    --output datasets/DF2K/DF2K_bicx4_sub \
+    --n_thread 20
 ```
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m torch.distributed.launch --nproc_per_node=8 --master_port=4321 hat/train.py -opt options/train/train_HAT_SRx2_from_scratch.yml --launcher pytorch
+
+Download pretrained teacher checkpoints from the official HAT repo:
+https://github.com/XPixelGroup/HAT#pretrained-models
+
+---
+
+## 3. YAML Option Reference
+
+All config files live in `options/train/` and `options/test/`.
+The KD pipeline uses `options/train/train_KD_RepSR_x4.yml`.
+
+### 3-a. Top-level settings
+
+| Key | Description | Example |
+|-----|-------------|---------|
+| `model_type` | Must be `KDSRModel` | `KDSRModel` |
+| `scale` | SR upscale factor | `4` |
+| `num_gpu` | Number of GPUs (`auto` = all visible) | `auto` |
+
+### 3-b. Student network (`network_g`)
+
+```yaml
+network_g:
+  type: RepSR
+  num_in_ch: 3               # input channels (3 = RGB)
+  num_feat: 64               # internal feature channels (controls width)
+  num_blocks: 8              # number of RepSR blocks (controls depth)
+  upscale: 4                 # SR scale factor
+  use_space_to_depth: false  # true -> apply nn.PixelUnshuffle at input
+  s2d_factor: 2              # PixelUnshuffle downscale factor (S2D=true only)
 ```
-- Note that the default batch size per gpu is 4, which will cost about 20G memory for each GPU.  
 
-The training logs and weights will be saved in the `./experiments` folder.
+**Space-to-Depth mode** (`use_space_to_depth: true`)
 
-## Results
-The inference results on benchmark datasets are available at
-[Google Drive](https://drive.google.com/drive/folders/1t2RdesqRVN7L6vCptneNRcpwZAo-Ub3L?usp=sharing) or [Baidu Netdisk](https://pan.baidu.com/s/1CQtLpty-KyZuqcSznHT_Zw) (access code: 63p5).
+Input is passed through `nn.PixelUnshuffle(s2d_factor)` before the main body.
+The effective upscale inside the network becomes `upscale x s2d_factor`.
+This lets the body operate on lower-resolution feature maps, which can
+reduce computation while keeping the final output resolution unchanged.
 
+### 3-c. Teacher network (`network_teacher`)
 
-## Contact
-If you have any question, please email chxy95@gmail.com or join in the [Wechat group of BasicSR](https://github.com/XPixelGroup/BasicSR#-contact) to discuss with the authors.
+Select HAT or MambaIRv2 by changing `type`:
+
+```yaml
+# HAT teacher
+network_teacher:
+  type: HAT
+  upscale: 4
+  img_size: 64
+  window_size: 16
+  embed_dim: 180
+  depths: [6, 6, 6, 6, 6, 6]
+  num_heads: [6, 6, 6, 6, 6, 6]
+  upsampler: 'pixelshuffle'
+  # ... (see options/train/train_KD_RepSR_x4.yml for full list)
+
+# MambaIRv2 teacher (requires mamba-ssm)
+network_teacher:
+  type: MambaIRv2
+  upscale: 4
+  embed_dim: 60
+  d_state: 8
+  depths: [6, 6, 6, 6]
+  # ... (see commented block in train_KD_RepSR_x4.yml)
+```
+
+### 3-d. Loss weights (`train`)
+
+```yaml
+train:
+  pixel_opt:
+    loss_weight: 0.5     # supervised L1 vs real HR GT (set 0 to disable)
+
+  kd_feat_opt:
+    loss_weight: 1.0     # FitNet MSE: projected student feat vs teacher feat
+
+  kd_output_opt:
+    loss_weight: 1.0     # L1: student output vs teacher pseudo-GT
+
+  student_feat_channels: 64   # must equal network_g.num_feat
+  teacher_feat_channels: 64   # fixed: HAT / MambaIRv2 conv_before_upsample = 64
+```
+
+### 3-e. Tiling (`tile`)
+
+Enable tiling for GPU-memory-limited validation or inference:
+
+```yaml
+tile:
+  tile_size: 256   # spatial tile size in pixels (multiple of window_size=16)
+  tile_pad: 32     # overlap padding between adjacent tiles (also multiple of 16)
+```
+
+Remove (or comment out) the `tile:` block to process images in one pass.
+
+---
+
+## 4. KD Training
+
+```bash
+# Single-GPU training
+python hat/train.py -opt options/train/train_KD_RepSR_x4.yml
+
+# Multi-GPU training (e.g., 4 GPUs)
+python -m torch.distributed.launch \
+    --nproc_per_node=4 \
+    --master_port=4321 \
+    hat/train.py -opt options/train/train_KD_RepSR_x4.yml \
+    --launcher pytorch
+
+# Resume from a checkpoint
+python hat/train.py -opt options/train/train_KD_RepSR_x4.yml \
+    --auto_resume
+```
+
+**Key paths to set in the YAML before training:**
+
+```yaml
+path:
+  pretrain_network_teacher: ./experiments/pretrained_models/HAT_SRx4_ImageNet-pretrain.pth
+  pretrain_network_g: ~          # or a student warmup checkpoint
+  resume_state: ~
+```
+
+Training outputs are saved to `experiments/train_KD_RepSR_x4/`.
+
+---
+
+## 5. Convert to Deployment Weights
+
+After training, fuse all multi-branch RepSRBlocks into single 3x3 convolutions
+using `scripts/convert_rep_sr.py`.
+
+```bash
+python scripts/convert_rep_sr.py \
+    --input  experiments/train_KD_RepSR_x4/models/net_g_latest.pth \
+    --output experiments/converted/RepSR_x4_deployed.pth \
+    --opt    options/train/train_KD_RepSR_x4.yml
+```
+
+The script will:
+1. Build the RepSR model from the YAML arch params.
+2. Load the BasicSR-format checkpoint (auto-detects `params_ema` / `params` keys).
+3. Call `model.reparameterize()` to fuse all branches.
+4. Run a quick shape sanity check.
+5. Save a plain state-dict `.pth` file.
+
+**Without a YAML file** (manual param specification):
+
+```bash
+python scripts/convert_rep_sr.py \
+    --input  experiments/train_KD_RepSR_x4/models/net_g_latest.pth \
+    --output experiments/converted/RepSR_x4_deployed.pth \
+    --num_feat 64 --num_blocks 8 --upscale 4 \
+    --use_space_to_depth false
+```
+
+**Load the deployed weights:**
+
+```python
+import torch
+from hat.archs.rep_sr_arch import RepSR
+
+model = RepSR(num_feat=64, num_blocks=8, upscale=4)
+model.load_state_dict(torch.load('experiments/converted/RepSR_x4_deployed.pth'))
+model.eval()
+```
+
+---
+
+## 6. Final Inference / Test
+
+Edit `options/test/test_KD_RepSR_x4.yml` and set the student checkpoint path:
+
+```yaml
+path:
+  pretrain_network_g: ./experiments/converted/RepSR_x4_deployed.pth
+  param_key_g: ~   # plain state-dict (no wrapper key)
+```
+
+Then run:
+
+```bash
+python hat/test.py -opt options/test/test_KD_RepSR_x4.yml
+```
+
+Results (SR images + PSNR/SSIM metrics) are saved to `results/test_KD_RepSR_x4/`.
+
+**Tiling for large images:**
+Uncomment the `tile:` block in the test YAML:
+
+```yaml
+tile:
+  tile_size: 256
+  tile_pad: 32
+```
+
+---
+
+## 7. Architecture Notes
+
+### RepSR
+
+| Training | Inference (after reparameterize) |
+|----------|----------------------------------|
+| 3x3 Conv + BN | Single fused 3x3 Conv |
+| 1x1 Conv + BN | (merged into above) |
+| Identity + BN | (merged into above) |
+
+- All branches are summed **before** the PReLU activation.
+- `reparameterize()` is mathematically lossless.
+- The `conv_body` layer (after the main block stack) is the KD feature hook point.
+
+### Knowledge Distillation Pipeline
+
+```
+LR Input
+   |
+   +--- Teacher (frozen, eval) ---------------------------------+
+   |       conv_before_upsample -> [hook] feat_T                |
+   |       -> pseudo-GT (HR output)                             |
+   |                                                             |
+   +--- Student (trainable) ------------------------------------+
+           conv_body -> [hook] feat_S                            |
+           -> student output                                     |
+                                                                 |
+   feat_S --[1x1 projector]--> feat_S_proj                      |
+                                                                 |
+   Loss = lambda_feat * MSE(feat_S_proj, feat_T)                |
+        + lambda_out  * L1(student_out, pseudo-GT) <------------+
+        + lambda_pix  * L1(student_out, GT_HR)   [optional]
+```
+
+### MambaIRv2
+
+Requires `pip install mamba-ssm einops`.
+The architecture combines window-based attention (Swin-style) with Mamba
+state-space models (ASSM) for efficient long-range dependency modelling.
+Set `type: MambaIRv2` in `network_teacher:` to use it as the teacher.
+
+### File Map
+
+| File | Role |
+|------|------|
+| `hat/archs/rep_sr_arch.py` | RepSR student architecture |
+| `hat/archs/mambairv2_arch.py` | MambaIRv2 teacher architecture |
+| `hat/models/kd_sr_model.py` | KD training + validation model |
+| `options/train/train_KD_RepSR_x4.yml` | Training configuration |
+| `options/test/test_KD_RepSR_x4.yml` | Test / inference configuration |
+| `scripts/convert_rep_sr.py` | Reparameterization & export script |
+
+---
+
+## Citation
+
+If you use this codebase, please cite the original works:
+
+```bibtex
+@inproceedings{chen2023hat,
+  title={Activating More Pixels in Image Super-Resolution Transformer},
+  author={Chen, Xiangyu and Wang, Xintao and Zhou, Jiantao and Qiao, Yu and Dong, Chao},
+  booktitle={CVPR},
+  year={2023}
+}
+
+@article{guo2024mambairv2,
+  title={MambaIR: A Simple Baseline for Image Restoration with State-Space Model},
+  author={Guo, Hang and Li, Jinmin and Dai, Tao and Ouyang, Zhihao and Ren, Xudong and Xia, Shu-Tao},
+  year={2024}
+}
+```

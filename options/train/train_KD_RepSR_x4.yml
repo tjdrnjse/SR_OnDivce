@@ -1,0 +1,208 @@
+# ============================================================
+# Knowledge Distillation SR Training: RepSR (Student) + HAT/MambaIRv2 (Teacher)
+# Scale: x4
+# ============================================================
+
+# general settings
+name: train_KD_RepSR_x4
+model_type: KDSRModel
+scale: 4
+num_gpu: auto
+manual_seed: 0
+
+# ============================================================
+# Dataset settings
+# ============================================================
+datasets:
+  train:
+    name: DF2K
+    type: PairedImageDataset
+    dataroot_gt: datasets/DF2K/DF2K_HR_sub
+    dataroot_lq: datasets/DF2K/DF2K_bicx4_sub
+    meta_info_file: hat/data/meta_info/meta_info_DF2Ksub_GT.txt
+    io_backend:
+      type: disk
+
+    gt_size: 256        # HR patch size (LR patch = 256/4 = 64)
+    use_hflip: true
+    use_rot: true
+
+    # data loader
+    use_shuffle: true
+    num_worker_per_gpu: 6
+    batch_size_per_gpu: 16   # RepSR is lightweight; larger batch is fine
+    dataset_enlarge_ratio: 1
+    prefetch_mode: ~
+
+  val_1:
+    name: Set5
+    type: PairedImageDataset
+    dataroot_gt: ./datasets/Set5/GTmod4
+    dataroot_lq: ./datasets/Set5/LRbicx4
+    io_backend:
+      type: disk
+
+  val_2:
+    name: Set14
+    type: PairedImageDataset
+    dataroot_gt: ./datasets/Set14/GTmod4
+    dataroot_lq: ./datasets/Set14/LRbicx4
+    io_backend:
+      type: disk
+
+# ============================================================
+# Student network (RepSR)
+#   - num_feat / num_blocks: tune model size here
+#   - use_space_to_depth: set true to enable PixelUnshuffle pre-processing
+#   - s2d_factor: PixelUnshuffle factor (only used when use_space_to_depth=true)
+# ============================================================
+network_g:
+  type: RepSR
+  num_in_ch: 3
+  num_feat: 64           # channel width (8 ~ 128)
+  num_blocks: 8          # number of RepSR blocks (depth)
+  upscale: 4
+  use_space_to_depth: false   # true → apply nn.PixelUnshuffle at input
+  s2d_factor: 2              # PixelUnshuffle factor when use_space_to_depth=true
+
+# ============================================================
+# Teacher network
+#   teacher_model_type: 'hat' or 'mambairv2'
+#
+#   HAT teacher example (default):
+# ============================================================
+network_teacher:
+  type: HAT                  # change to 'MambaIRv2' to use MambaIRv2 teacher
+  upscale: 4
+  in_chans: 3
+  img_size: 64
+  window_size: 16
+  compress_ratio: 3
+  squeeze_factor: 30
+  conv_scale: 0.01
+  overlap_ratio: 0.5
+  img_range: 1.
+  depths: [6, 6, 6, 6, 6, 6]
+  embed_dim: 180
+  num_heads: [6, 6, 6, 6, 6, 6]
+  mlp_ratio: 2
+  upsampler: 'pixelshuffle'
+  resi_connection: '1conv'
+
+# ---- MambaIRv2 teacher (uncomment to switch) ----
+# network_teacher:
+#   type: MambaIRv2
+#   upscale: 4
+#   img_size: 64
+#   embed_dim: 60
+#   d_state: 8
+#   depths: [6, 6, 6, 6]
+#   num_heads: [4, 4, 4, 4]
+#   window_size: 16
+#   inner_rank: 32
+#   num_tokens: 64
+#   convffn_kernel_size: 5
+#   mlp_ratio: 2.
+#   img_range: 1.
+#   upsampler: 'pixelshuffle'
+#   resi_connection: '1conv'
+
+# ============================================================
+# Tile settings (used during validation for large images)
+#   tile_size: must be a multiple of teacher window_size (16)
+#   tile_pad:  overlap between adjacent tiles
+# ============================================================
+# tile:
+#   tile_size: 256
+#   tile_pad: 32
+
+# ============================================================
+# Path settings
+# ============================================================
+path:
+  # Student: start from scratch (or provide pretrained path)
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~
+
+  # Teacher: REQUIRED – provide the pretrained HAT/MambaIRv2 checkpoint
+  pretrain_network_teacher: ./experiments/pretrained_models/HAT_SRx4_ImageNet-pretrain.pth
+  # param key inside the checkpoint file (usually 'params_ema' for HAT)
+  # KDSRModel handles both 'params_ema' and 'params' automatically.
+
+# ============================================================
+# Training settings
+# ============================================================
+train:
+  ema_decay: 0.999
+
+  optim_g:
+    type: Adam
+    lr: !!float 2e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: MultiStepLR
+    milestones: [200000, 300000, 350000, 375000]
+    gamma: 0.5
+
+  total_iter: 400000
+  warmup_iter: -1   # no warm up
+
+  # ── Supervised pixel loss (vs real HR ground truth) ──────────────────
+  # Remove or set loss_weight to 0.0 to disable.
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 0.5
+    reduction: mean
+
+  # ── Feature-level KD loss (FitNet MSE) ───────────────────────────────
+  # Compares student conv_body features (projected) vs teacher
+  # conv_before_upsample features.
+  kd_feat_opt:
+    loss_weight: 1.0    # increase to strengthen feature alignment
+
+  # ── Output-level KD loss (L1 vs teacher pseudo-GT) ───────────────────
+  kd_output_opt:
+    loss_weight: 1.0    # increase to strengthen output alignment
+
+  # ── Channel dimensions for the feature projector ─────────────────────
+  student_feat_channels: 64   # must match network_g.num_feat
+  teacher_feat_channels: 64   # fixed: HAT/MambaIRv2 conv_before_upsample = 64
+
+# ============================================================
+# Validation settings
+# ============================================================
+val:
+  val_freq: !!float 5e3
+  save_img: false
+  pbar: false
+
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 4
+      test_y_channel: true
+      better: higher
+    ssim:
+      type: calculate_ssim
+      crop_border: 4
+      test_y_channel: true
+      better: higher
+
+# ============================================================
+# Logging settings
+# ============================================================
+logger:
+  print_freq: 100
+  save_checkpoint_freq: !!float 5e3
+  use_tb_logger: true
+  wandb:
+    project: ~
+    resume_id: ~
+
+# dist training settings
+dist_params:
+  backend: nccl
+  port: 29500

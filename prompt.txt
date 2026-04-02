@@ -1,0 +1,40 @@
+현재 HAT 디렉토리( https://github.com/XPixelGroup/HAT.git 를 클론한 상태)를 베이스 프레임워크(BasicSR 기반)로 사용하여 새로운 Knowledge Distillation(KD) SR 파이프라인을 구축해줘. 추가 기능들은 아래 명시된 git repository URL들을 참조하여 코드를 가져오고, 다음 요구사항을 모두 만족하도록 파일을 수정 및 생성해.
+
+1. Teacher 모델 구조 추가 (MambaIRv2):
+- 참고 레포지토리: https://github.com/csguoh/MambaIR.git
+- 위 레포지토리에서 `MambaIRv2` 아키텍처 코드를 추출하여 `basicsr/archs/mambairv2_arch.py`로 추가해.
+- YAML 설정 파일(`options/`)에서 `teacher_model_type` 옵션(hat 또는 mambairv2)으로 두 Teacher 중 하나를 선택할 수 있게 등록(@ARCH_REGISTRY)해줘.
+
+2. Student 모델 구조 추가 및 최적화 (Rep-SR + Space-to-Depth 옵션화):
+- 참고 레포지토리: https://github.com/JL-DY/RepSR
+- 위 레포에서 RepVGG 기반 SR 아키텍처를 추출하여 `basicsr/archs/rep_sr_arch.py`를 생성하되, 다음 구조를 반드시 반영해.
+- [Space-to-Depth ON/OFF]: YAML 설정에 `use_space_to_depth` (True/False) 옵션을 추가해. True일 경우 PyTorch 내장 `nn.PixelUnshuffle`을 모델 입력단에 적용하고 출력단 스케일을 그에 맞춰 조정하도록 동적 라우팅을 구현해. False일 경우 일반적인 SR 구조로 동작하게 해.
+- 이 모델은 학습 시 3x3 Conv, 1x1 Conv, Identity 브랜치를 가지며, 추론(Inference) 시 수학적으로 단일 3x3 Conv로 가중치가 융합(Reparameterization)되는 `reparameterize()` 메서드가 모델 클래스 내에 반드시 포함되어야 해. 
+- YAML 설정에서 Student 모델의 블록 수(layer)와 채널(channel) 크기를 조절할 수 있도록 변수화해줘.
+
+3. Knowledge Distillation 학습 파이프라인 구축 (FitNet SR 적용):
+- 참고 레포지토리 1: https://github.com/HobbitLong/RepDistiller.git
+- 참고 레포지토리 2: https://github.com/adri-romsor/FitNets.git
+- `basicsr/models/kd_sr_model.py`를 생성하여 다음 KD 로직을 구현해.
+- [On-the-fly Pseudo-GT]: Teacher 모델은 Gradient를 비활성화(`requires_grad=False`, `.eval()`)하고, 매 iteration마다 LR 입력을 받아 HR Pseudo-GT를 동적으로 생성해.
+- [Feature-level KD (FitNet)]: Teacher의 업샘플링 직전 Feature map과 Student의 업샘플링 직전 Feature map을 추출해. Student 피처맵 채널을 Teacher와 맞추는 1x1 Conv Projector(학습 가능)를 선언하고, 두 피처맵 간의 MSE Loss를 계산해.
+- [Output-level KD]: Teacher의 최종 SR 출력과 Student의 최종 출력 간의 L1 Loss를 계산해.
+- YAML에서 Feature KD Loss와 Output KD Loss의 가중치(Weight)를 각각 조절할 수 있게 파라미터화 해줘.
+
+4. Tiling 기법 호환성 보장:
+- HAT repo에 구현된 추론용 Tiling 기법(Patch 분할 및 병합)이 Teacher 모델(Pseudo-GT 생성 시)과 Student 모델 양쪽 모두에 정상 작동하도록 연계해. 
+- YAML에서 `tile_size` (패치 크기)와 `tile_pad` (오버랩 패딩 크기)를 설정할 수 있게 해줘.
+
+5. PyTorch 호환성 동기화 및 독립 스크립트 생성:
+- 모든 추출된 코드는 베이스인 'HAT' 구동 최신 PyTorch 버전에 맞춰 문법 충돌을 해결하고 최적화해.
+- 학습(`train.py`)과 테스트(`test.py`) 스크립트가 정상 동작하도록 구성하고, 추가로 **`scripts/convert_rep_sr.py`** 라는 독립된 스크립트를 만들어줘. 
+- 이 스크립트는 원본 레포가 아닌 'BasicSR 프레임워크 형식'으로 저장된 Student의 `.pth` 파일을 정상적으로 로드하여 `reparameterize()`를 수행한 뒤, 모바일 배포용으로 브랜치가 병합된 순수 3x3 Conv `.pth` 파일로 다시 저장하는 역할을 해야 해.
+
+6. README.md 상세 작성 (Turn-key 실행 가이드):
+- 파일 최상단 README.md를 덮어써서 개발자가 즉시 실험을 돌릴 수 있는 '단계별(Step-by-Step) 매뉴얼'을 작성해.
+- 포함할 내용: 
+  1) 환경 셋팅 및 데이터셋(LR/HR) 디렉토리 구성 방법.
+  2) YAML 옵션 상세 설명 (Teacher/Student 선택, 크기/배수 설정, Space-to-Depth ON/OFF, Loss 가중치, Tiling 사이즈 등).
+  3) KD 학습 실행 명령어 (`python train.py -opt ...`).
+  4) 학습 완료 후 `convert_rep_sr.py`를 사용한 모바일 배포용 가중치 변환 명령어.
+  5) 변환된 가중치를 이용한 최종 테스트(Inference) 실행 명령어.

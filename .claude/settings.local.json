@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(curl -s \"https://raw.githubusercontent.com/csguoh/MambaIR/main/basicsr/archs/mambairv2_arch.py\")",
+      "WebFetch(domain:api.github.com)"
+    ]
+  }
+}
