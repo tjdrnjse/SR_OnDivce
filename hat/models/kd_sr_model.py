@@ -27,6 +27,7 @@ YAML keys for tiling (under root level, same as HATModel):
 """
 
 import math
+from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -123,6 +124,10 @@ class KDSRModel(SRModel):
     """
 
     def __init__(self, opt):
+        # super().__init__ calls init_training_settings() when is_train=True.
+        # Our override of init_training_settings deliberately skips
+        # setup_optimizers/setup_schedulers so they can be called below,
+        # after feat_projector is built.
         super().__init__(opt)
         logger = get_root_logger()
 
@@ -157,8 +162,8 @@ class KDSRModel(SRModel):
         # ------------------------------------------------------------------ #
         # Feature hooks                                                        #
         # ------------------------------------------------------------------ #
-        self._teacher_feat: torch.Tensor = None
-        self._student_feat: torch.Tensor = None
+        self._teacher_feat = None
+        self._student_feat = None
         self._register_feature_hooks()
 
         # ------------------------------------------------------------------ #
@@ -186,12 +191,71 @@ class KDSRModel(SRModel):
             'kd_output_opt', {}
         ).get('loss_weight', 1.0)
 
+        # ------------------------------------------------------------------ #
+        # Optimizer + scheduler (deferred from init_training_settings so that  #
+        # feat_projector is available when setup_optimizers runs)              #
+        # ------------------------------------------------------------------ #
+        if self.is_train:
+            self.setup_optimizers()
+            self.setup_schedulers()
+
         logger.info(
             f'KDSRModel | teacher: {teacher_opt["type"]} | '
             f'student: {opt["network_g"]["type"]} | '
             f'feat_weight={self.kd_feat_weight} | '
             f'output_weight={self.kd_output_weight}'
         )
+
+    # ---------------------------------------------------------------------- #
+    # Training settings init (override to fix two parent bugs)                #
+    # ---------------------------------------------------------------------- #
+
+    def init_training_settings(self):
+        """Override SRModel.init_training_settings for two reasons:
+
+        1. The parent raises ValueError when both pixel_opt and perceptual_opt
+           are absent — but KDSRModel always has KD losses, so the check is wrong.
+        2. The parent calls setup_optimizers() here, but our override of
+           setup_optimizers() references self.feat_projector which is not yet
+           created at this point in __init__.  We defer those calls to the end
+           of KDSRModel.__init__ instead.
+        """
+        self.net_g.train()
+        train_opt = self.opt['train']
+
+        # EMA model (mirrors parent logic exactly)
+        self.ema_decay = train_opt.get('ema_decay', 0)
+        if self.ema_decay > 0:
+            logger = get_root_logger()
+            logger.info(
+                f'Use Exponential Moving Average with decay: {self.ema_decay}'
+            )
+            net_g_opt = deepcopy(self.opt['network_g'])
+            net_type = net_g_opt.pop('type')
+            self.net_g_ema = ARCH_REGISTRY.get(net_type)(**net_g_opt).to(self.device)
+            load_path = self.opt['path'].get('pretrain_network_g', None)
+            if load_path is not None:
+                self.load_network(
+                    self.net_g_ema, load_path,
+                    self.opt['path'].get('strict_load_g', True), 'params_ema'
+                )
+            else:
+                self.model_ema(0)
+            self.net_g_ema.eval()
+
+        # Optional supervised pixel loss vs real HR GT
+        if train_opt.get('pixel_opt'):
+            from basicsr.losses import build_loss
+            self.cri_pix = build_loss(train_opt['pixel_opt']).to(self.device)
+        else:
+            self.cri_pix = None
+
+        # Perceptual loss not used in KD pipeline
+        self.cri_perceptual = None
+
+        # DO NOT call setup_optimizers() or setup_schedulers() here.
+        # They are called at the end of KDSRModel.__init__ once feat_projector
+        # has been created.
 
     # ---------------------------------------------------------------------- #
     # Hook registration                                                        #
@@ -326,9 +390,11 @@ class KDSRModel(SRModel):
             {'params': self.net_g.parameters()},
             {'params': self.feat_projector.parameters()},
         ]
-        optim_type = train_opt['optim_g'].pop('type')
+        # Copy to avoid mutating the config dict (which would break resume)
+        optim_cfg = {k: v for k, v in train_opt['optim_g'].items() if k != 'type'}
+        optim_type = train_opt['optim_g']['type']
         self.optimizer_g = self.get_optimizer(
-            optim_type, optim_params, **train_opt['optim_g']
+            optim_type, optim_params, **optim_cfg
         )
         self.optimizers.append(self.optimizer_g)
 
@@ -360,18 +426,24 @@ class KDSRModel(SRModel):
             ]
             # teacher_feat is stored in self._teacher_feat by hook
 
-        teacher_feat = self._teacher_feat.detach()
+        # teacher_feat shape: (B, 64, H_lr+pad_h, W_lr+pad_w) — includes padding
+        # Crop it back to original LR spatial size so we only supervise on real content.
+        teacher_feat = self._teacher_feat[:, :, :h, :w].detach()
 
         # ---- Student: forward pass, capture student features ----------------
         self.net_g.train()
         student_out = self.net_g(self.lq)
-        student_feat = self._student_feat  # (B, student_ch, H', W')
+        # student_feat shape: (B, student_ch, H_lr, W_lr) without S2D
+        #                     (B, student_ch, H_lr/r, W_lr/r) with S2D
+        student_feat = self._student_feat
 
         # ---- Feature-level KD loss (FitNet MSE) ----------------------------
-        # Project student features to teacher channel dim
+        # Project student channels → teacher channels
         student_feat_proj = self.feat_projector(student_feat)
 
-        # Align spatial resolution (may differ when S2D is enabled)
+        # Align spatial resolution: after crop, teacher_feat is (B,64,H_lr,W_lr).
+        # If S2D is active, student_feat_proj is at (H_lr/r, W_lr/r) — upsample
+        # to match teacher resolution so MSE is computed at the same grid.
         if student_feat_proj.shape[2:] != teacher_feat.shape[2:]:
             student_feat_proj = F.interpolate(
                 student_feat_proj,

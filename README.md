@@ -276,7 +276,119 @@ tile:
 
 ---
 
-## 7. Architecture Notes
+## 7. End-to-End Experiment Example (x4 SR, HAT Teacher)
+
+아래는 HAT teacher + RepSR student, scale×4, GPU 1장 기준으로 처음부터 끝까지 실행하는 전체 명령어 예시입니다.
+
+### Step 1 — 학습 (KD Training)
+
+```bash
+# DF2K 데이터셋 준비 및 teacher 체크포인트 다운로드 후 실행
+python hat/train.py -opt options/train/train_KD_RepSR_x4.yml
+```
+
+학습 로그/체크포인트: `experiments/train_KD_RepSR_x4/`
+
+학습 중 중간 검증 결과 (Set5 PSNR/SSIM)는 `5000 iter`마다 콘솔에 출력됩니다.
+
+```
+[train_KD_RepSR_x4 iter:5000] psnr: 28.42 dB  ssim: 0.8031
+[train_KD_RepSR_x4 iter:10000] psnr: 28.91 dB  ssim: 0.8112
+...
+```
+
+**Space-to-Depth 활성화 실험** (더 빠른 inference를 원할 때):
+
+```yaml
+# options/train/train_KD_RepSR_x4.yml 수정
+network_g:
+  type: RepSR
+  num_feat: 64
+  num_blocks: 8
+  upscale: 4
+  use_space_to_depth: true   # ← 변경
+  s2d_factor: 2
+```
+
+```bash
+python hat/train.py -opt options/train/train_KD_RepSR_x4.yml
+```
+
+**MambaIRv2 Teacher로 전환** (mamba-ssm 설치 필요):
+
+```yaml
+# network_teacher 섹션 교체 (YAML 내 주석 해제)
+network_teacher:
+  type: MambaIRv2
+  upscale: 4
+  embed_dim: 60
+  d_state: 8
+  depths: [6, 6, 6, 6]
+  num_heads: [4, 4, 4, 4]
+  window_size: 16
+  inner_rank: 32
+  num_tokens: 64
+  convffn_kernel_size: 5
+  mlp_ratio: 2.
+  img_range: 1.
+  upsampler: 'pixelshuffle'
+  resi_connection: '1conv'
+```
+
+```bash
+python hat/train.py -opt options/train/train_KD_RepSR_x4.yml
+```
+
+---
+
+### Step 2 — 가중치 변환 (Reparameterization)
+
+학습 완료 후 다중 브랜치를 단일 3×3 Conv로 융합합니다.
+
+```bash
+# 권장: YAML 기반 (아키텍처 파라미터 자동 인식)
+python scripts/convert_rep_sr.py \
+    --input  experiments/train_KD_RepSR_x4/models/net_g_400000.pth \
+    --output experiments/converted/RepSR_x4_deployed.pth \
+    --opt    options/train/train_KD_RepSR_x4.yml
+```
+
+예상 출력:
+```
+[convert_rep_sr] Architecture parameters:
+  num_feat: 64, num_blocks: 8, upscale: 4, use_space_to_depth: False
+[convert_rep_sr] Auto-detected param key: "params_ema"
+[convert_rep_sr] Reparameterizing RepSR blocks ...
+[convert_rep_sr] Done. All RepSRBlocks fused into single Conv2d.
+[convert_rep_sr] Sanity check passed. Output shape: (1, 3, 256, 256)
+[convert_rep_sr] Saved deployed checkpoint to: experiments/converted/RepSR_x4_deployed.pth
+[convert_rep_sr] Model parameters: 0.412 M
+```
+
+---
+
+### Step 3 — 최종 추론 (Inference / Test)
+
+```bash
+# test YAML의 체크포인트 경로를 변환된 파일로 수정 후 실행
+python hat/test.py -opt options/test/test_KD_RepSR_x4.yml
+```
+
+결과 이미지 및 PSNR/SSIM: `results/test_KD_RepSR_x4/`
+
+**메모리 제한 GPU에서 타일 추론:**
+
+```bash
+# options/test/test_KD_RepSR_x4.yml 에서 tile 블록 주석 해제:
+#   tile:
+#     tile_size: 256
+#     tile_pad: 32
+python hat/test.py -opt options/test/test_KD_RepSR_x4.yml
+```
+
+---
+
+## 8. Architecture Notes
 
 ### RepSR
 

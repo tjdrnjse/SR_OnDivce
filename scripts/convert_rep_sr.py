@@ -36,6 +36,7 @@ import sys
 import os
 from pathlib import Path
 from collections import OrderedDict
+from typing import Optional
 
 import torch
 
@@ -98,7 +99,7 @@ def load_arch_params_from_yaml(opt_path: str) -> dict:
     }
 
 
-def extract_state_dict(ckpt: dict, param_key: str | None) -> OrderedDict:
+def extract_state_dict(ckpt: dict, param_key: Optional[str]) -> OrderedDict:
     """Extract the raw model state-dict from a (possibly wrapped) checkpoint."""
     if param_key is not None:
         if param_key not in ckpt:
