@@ -226,6 +226,8 @@ Remove (or comment out) the `tile:` block to process images in one pass.
 
 ## 4. KD Training
 
+### 4-a. x4 모델 (기존)
+
 ```bash
 # Single-GPU training
 python hat/train.py -opt options/train/train_KD_RepSR_x4.yml
@@ -252,6 +254,44 @@ path:
 ```
 
 Training outputs are saved to `experiments/train_KD_RepSR_x4/`.
+
+---
+
+### 4-b. x3 Mobile 10MB 모델 (`train_KD_RepSR_x3_10MB.yml`)
+
+x3 스케일, **~10 MB (FP32) / ~2.5 M 파라미터** 크기의 Mobile-target RepSR 학습 설정입니다.
+
+```bash
+python hat/train.py -opt options/train/train_KD_RepSR_x3_10MB.yml
+```
+
+**실행 전 YAML에서 경로 변경 필요:**
+
+```yaml
+path:
+  pretrain_network_g: /path/to/student_pretrained.pth   # 또는 ~ (scratch)
+  pretrain_network_t: /path/to/hat_x3_imagenet_pretrained.pth  # 필수
+
+datasets:
+  train_1:
+    dataroot_lq: /your/real/lr_dataset_1
+  train_2:
+    dataroot_lq: /your/real/lr_dataset_2
+```
+
+**주요 설계 의도:**
+
+| 옵션 | 값 | 이유 |
+|---|---|---|
+| `scale` | 3 | x3 SR 태스크 (모바일 디스플레이 업스케일 대상) |
+| `num_feat` / `num_blocks` | 128 / 10 | FP32 ~10 MB, on-device 추론 가능한 최대 크기 |
+| `use_space_to_depth` | false | 학습 단순화; S2D는 추후 실험에서 별도 비교 |
+| `lq_patch_size` | 256 | 큰 수용 영역(receptive field) 확보로 텍스처 복원력 향상 |
+| `SingleLRDataset` × 2 | train_1 + train_2 | HR 이미지 없이 두 도메인의 실제 LR 이미지 동시 활용; Teacher가 Pseudo-GT 생성 |
+| `strict_load_g` | false | 이전 체크포인트와 아키텍처 구조가 다소 달라도 부분 로드 허용 |
+| `pixel_opt` | 주석 처리 | `SingleLRDataset`은 GT를 제공하지 않으므로 KD loss만 사용 |
+
+Training outputs: `experiments/train_KD_RepSR_x3_10MB/`
 
 ---
 

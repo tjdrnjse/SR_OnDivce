@@ -1,0 +1,213 @@
+# ============================================================
+# Knowledge Distillation SR Training
+#   Student : RepSR  (~10 MB / ~2.5 M params, FP32)
+#   Teacher : HAT    (ImageNet pretrained, frozen)
+#   Scale   : x3
+# ============================================================
+
+# ── General ──────────────────────────────────────────────────
+name: train_KD_RepSR_x3_10MB
+model_type: KDSRModel
+scale: 3
+num_gpu: auto
+manual_seed: 0
+
+# ============================================================
+# Dataset settings
+#   Two real-LR datasets are trained simultaneously via
+#   train_1 / train_2.  Both use SingleLRDataset, which
+#   loads images at their native LR resolution (no bicubic
+#   downsampling) and applies only a random crop.
+#   The frozen HAT teacher generates Pseudo-GT HR patches
+#   on-the-fly during training.
+# ============================================================
+datasets:
+  train_1:
+    name: LR_dataset_1
+    type: SingleLRDataset
+    dataroot_lq: /path/to/dummy/dataset1    # <-- replace with real LR image folder
+    io_backend:
+      type: disk
+
+    lq_patch_size: 256    # random-crop size in LR space (no resize)
+    use_hflip: true
+    use_rot: true
+
+    use_shuffle: true
+    num_worker_per_gpu: 4
+    batch_size_per_gpu: 8
+    dataset_enlarge_ratio: 1
+    prefetch_mode: ~
+
+  train_2:
+    name: LR_dataset_2
+    type: SingleLRDataset
+    dataroot_lq: /path/to/dummy/dataset2    # <-- replace with real LR image folder
+    io_backend:
+      type: disk
+
+    lq_patch_size: 256
+    use_hflip: true
+    use_rot: true
+
+    use_shuffle: true
+    num_worker_per_gpu: 4
+    batch_size_per_gpu: 8
+    dataset_enlarge_ratio: 1
+    prefetch_mode: ~
+
+  val_1:
+    name: Set5
+    type: PairedImageDataset
+    dataroot_gt: ./datasets/Set5/GTmod3
+    dataroot_lq: ./datasets/Set5/LRbicx3
+    io_backend:
+      type: disk
+
+  val_2:
+    name: Set14
+    type: PairedImageDataset
+    dataroot_gt: ./datasets/Set14/GTmod3
+    dataroot_lq: ./datasets/Set14/LRbicx3
+    io_backend:
+      type: disk
+
+# ============================================================
+# Student network (RepSR)
+#   num_feat=128, num_blocks=10  →  ~2.5 M params (~10 MB FP32)
+#   use_space_to_depth: false    →  standard forward (no S2D)
+# ============================================================
+network_g:
+  type: RepSR
+  num_in_ch: 3
+  num_feat: 128        # channel width  (controls model size)
+  num_blocks: 10       # block depth    (controls model size)
+  upscale: 3
+  use_space_to_depth: false
+  s2d_factor: 2        # only used when use_space_to_depth: true
+
+# ============================================================
+# Teacher network (HAT, ImageNet pretrained)
+#   Standard HAT-base configuration used in the original paper.
+#   These weights are frozen throughout training.
+# ============================================================
+network_teacher:
+  type: HAT
+  upscale: 3
+  in_chans: 3
+  img_size: 64
+  window_size: 16
+  compress_ratio: 3
+  squeeze_factor: 30
+  conv_scale: 0.01
+  overlap_ratio: 0.5
+  img_range: 1.
+  depths: [6, 6, 6, 6, 6, 6]
+  embed_dim: 180
+  num_heads: [6, 6, 6, 6, 6, 6]
+  mlp_ratio: 2
+  upsampler: 'pixelshuffle'
+  resi_connection: '1conv'
+
+# ============================================================
+# Tiling (uncomment for validation on large images)
+#   patch_size  : LR tile size fed to the model
+#   overlap_size: LR overlap between tiles
+#                 HR overlap = overlap_size * scale (= overlap_size * 3)
+# ============================================================
+# tile:
+#   patch_size: 256
+#   overlap_size: 32
+
+# ============================================================
+# Path settings
+# ============================================================
+path:
+  # Student: load a pretrained checkpoint to warm-start fine-tuning.
+  # Set to ~ to train from scratch.
+  pretrain_network_g: /path/to/dummy/student_pretrained.pth
+  strict_load_g: false      # false allows partial weight loading (e.g. mismatched head)
+  resume_state: ~
+
+  # Teacher: REQUIRED – pretrained HAT x3 checkpoint.
+  pretrain_network_t: /path/to/dummy/hat_x3_imagenet_pretrained.pth
+  # KDSRModel auto-detects 'params_ema' / 'params' keys inside the file.
+
+# ============================================================
+# Training settings
+# ============================================================
+train:
+  ema_decay: 0.999
+
+  optim_g:
+    type: Adam
+    lr: !!float 2e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: MultiStepLR
+    milestones: [200000, 300000, 350000, 375000]
+    gamma: 0.5
+
+  total_iter: 400000
+  warmup_iter: -1    # no warm-up
+
+  # ── Feature-level KD loss (FitNet MSE) ──────────────────────
+  # Aligns student conv_body features (projected) with teacher
+  # conv_before_upsample features.
+  kd_feat_opt:
+    loss_weight: 1.0
+
+  # ── Output-level KD loss (L1 vs teacher Pseudo-GT) ──────────
+  kd_output_opt:
+    loss_weight: 1.0
+
+  # ── Optional supervised pixel loss vs real HR GT ────────────
+  # Requires 'gt' key in the dataset dict.
+  # Comment out or set loss_weight: 0.0 when using SingleLRDataset
+  # (which provides no HR ground-truth).
+  # pixel_opt:
+  #   type: L1Loss
+  #   loss_weight: 0.5
+  #   reduction: mean
+
+  # ── Channel dimensions for the 1x1 feature projector ────────
+  student_feat_channels: 128   # must match network_g.num_feat
+  teacher_feat_channels: 64    # fixed: HAT conv_before_upsample outputs 64 ch
+
+# ============================================================
+# Validation settings
+# ============================================================
+val:
+  val_freq: !!float 5e3
+  save_img: false
+  pbar: false
+
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 3           # must equal scale
+      test_y_channel: true
+      better: higher
+    ssim:
+      type: calculate_ssim
+      crop_border: 3
+      test_y_channel: true
+      better: higher
+
+# ============================================================
+# Logging settings
+# ============================================================
+logger:
+  print_freq: 100
+  save_checkpoint_freq: !!float 5e3
+  use_tb_logger: true
+  wandb:
+    project: ~
+    resume_id: ~
+
+# dist training settings
+dist_params:
+  backend: nccl
+  port: 29500
