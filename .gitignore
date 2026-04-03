@@ -120,6 +120,12 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+# Non-standard virtual environment directory names (e.g. hat_venv/, my_venv/)
+*_venv/
+*-venv/
+
+# Prompt/notes files (local working notes, must not pollute the repo)
+*prompt*.txt
 
 # Spyder project settings
 .spyderproject
