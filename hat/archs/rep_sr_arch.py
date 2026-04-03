@@ -1,10 +1,11 @@
 """
-RepSR architecture: RepVGG-based Super-Resolution network.
+RepSR architecture: SR-optimized reparameterizable Super-Resolution network.
 Adapted from: https://github.com/JL-DY/RepSR
 Ported to BasicSR/HAT framework.
 
 Features:
-  - Multi-branch training (3x3 Conv, 1x1 Conv, Identity), each with BN
+  - SR-optimized multi-branch block: 2x (Conv3x3 -> BN -> Conv1x1) + Identity
+  - Channel expansion (c -> 2c -> c) inside each branch for SR feature capacity
   - Single 3x3 Conv inference via structural reparameterization
   - Optional Space-to-Depth (nn.PixelUnshuffle) pre-processing
   - Configurable block count and channel width via YAML
@@ -18,12 +19,22 @@ from basicsr.utils.registry import ARCH_REGISTRY
 
 
 class RepSRBlock(nn.Module):
-    """RepVGG-style residual block with structural reparameterization.
+    """SR-optimized reparameterizable block.
 
-    During training: three parallel branches (3x3+BN, 1x1+BN, Identity+BN)
-    are summed before the activation.
-    At inference: call reparameterize() to fuse all branches into a single
-    3x3 convolution, then set self.deployed = True.
+    During training, two symmetric branches are summed with an identity skip:
+        out = x + branch1(x) + branch2(x)
+    Each branch expands channels (c -> 2c -> c):
+        branch(x) = Conv1x1(BN(Conv3x3(x)))
+                    Conv(c->2c, 3x3) -> BN(2c) -> Conv(2c->c, 1x1)
+
+    At inference, call reparameterize() to fuse the entire block into a
+    single equivalent 3x3 Conv. The fused kernel is derived as follows:
+        1. Fuse Conv3x3 + BN  ->  k_fused (2c, c, 3, 3), b_fused (2c,)
+        2. Apply Conv1x1 weights to collapse 2c back to c:
+               merged_w[i,k,h,w] = sum_j  W1[i,j] * k_fused[j,k,h,w]
+               merged_b[i]       = sum_j  W1[i,j] * b_fused[j]  +  b1[i]
+        3. Add identity kernel (1.0 at each [i,i,1,1]) for the skip branch.
+        4. Sum both merged branch kernels and the identity kernel.
 
     Args:
         num_feat (int): Number of feature channels (in == out).
@@ -33,55 +44,61 @@ class RepSRBlock(nn.Module):
         super().__init__()
         self.num_feat = num_feat
         self.deployed = False
+        mid = num_feat * 2  # channel expansion factor
 
-        # 3x3 Conv branch
-        self.branch_3x3 = nn.Sequential(
-            nn.Conv2d(num_feat, num_feat, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(num_feat)
-        )
-        # 1x1 Conv branch
-        self.branch_1x1 = nn.Sequential(
-            nn.Conv2d(num_feat, num_feat, 1, 1, 0, bias=False),
-            nn.BatchNorm2d(num_feat)
-        )
-        # Identity branch (BN only; identity kernel fused at reparameterize)
-        self.branch_id = nn.BatchNorm2d(num_feat)
+        # Branch 1: Conv(c->2c, 3x3, no bias) -> BN(2c) -> Conv(2c->c, 1x1, bias)
+        self.branch1_3x3 = nn.Conv2d(num_feat, mid, 3, 1, 1, bias=False)
+        self.branch1_bn  = nn.BatchNorm2d(mid)
+        self.branch1_1x1 = nn.Conv2d(mid, num_feat, 1, 1, 0, bias=True)
+
+        # Branch 2: identical structure, independent weights
+        self.branch2_3x3 = nn.Conv2d(num_feat, mid, 3, 1, 1, bias=False)
+        self.branch2_bn  = nn.BatchNorm2d(mid)
+        self.branch2_1x1 = nn.Conv2d(mid, num_feat, 1, 1, 0, bias=True)
+
+    def _branch_forward(self, x, conv3x3, bn, conv1x1):
+        return conv1x1(bn(conv3x3(x)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.deployed:
             return self.rep_conv(x)
-        return self.branch_3x3(x) + self.branch_1x1(x) + self.branch_id(x)
+        return (x
+                + self._branch_forward(x, self.branch1_3x3, self.branch1_bn, self.branch1_1x1)
+                + self._branch_forward(x, self.branch2_3x3, self.branch2_bn, self.branch2_1x1))
 
     # ------------------------------------------------------------------
     # Reparameterization helpers
     # ------------------------------------------------------------------
 
-    def _fuse_conv_bn(self, conv: nn.Conv2d, bn: nn.BatchNorm2d):
-        """Fuse a Conv2d + BatchNorm2d into a single Conv2d (weight, bias)."""
-        kernel = conv.weight                          # (C_out, C_in, kH, kW)
-        std = (bn.running_var + bn.eps).sqrt()
-        t = (bn.weight / std).reshape(-1, 1, 1, 1)
-        fused_weight = kernel * t
-        fused_bias = bn.bias - bn.running_mean * bn.weight / std
-        return fused_weight, fused_bias
+    def _fuse_branch(self, conv3x3: nn.Conv2d, bn: nn.BatchNorm2d, conv1x1: nn.Conv2d):
+        """Fuse Conv3x3 + BN + Conv1x1 into an equivalent (weight, bias) pair.
 
-    def _fuse_identity_bn(self, bn: nn.BatchNorm2d):
-        """Fuse identity mapping + BN into a (weight, bias) pair."""
-        # Create identity kernel: shape (C, C, 3, 3), center=1
-        c = self.num_feat
-        identity_kernel = torch.zeros(c, c, 3, 3,
-                                      dtype=bn.weight.dtype,
-                                      device=bn.weight.device)
-        for i in range(c):
-            identity_kernel[i, i, 1, 1] = 1.0
-        std = (bn.running_var + bn.eps).sqrt()
-        t = (bn.weight / std).reshape(-1, 1, 1, 1)
-        fused_weight = identity_kernel * t
-        fused_bias = bn.bias - bn.running_mean * bn.weight / std
-        return fused_weight, fused_bias
+        Returns:
+            merged_w: (num_feat, num_feat, 3, 3)
+            merged_b: (num_feat,)
+        """
+        # ---- Step 1: fuse Conv3x3 (c->2c) with BN(2c) ----
+        # k_fused[j, k, h, w] = (gamma_j / std_j) * conv3x3.weight[j, k, h, w]
+        # b_fused[j]           = beta_j - mean_j * gamma_j / std_j
+        k3 = conv3x3.weight                                    # (2c, c, 3, 3)
+        std = (bn.running_var + bn.eps).sqrt()                 # (2c,)
+        t = (bn.weight / std).reshape(-1, 1, 1, 1)            # (2c, 1, 1, 1)
+        k_fused = k3 * t                                       # (2c, c, 3, 3)
+        b_fused = bn.bias - bn.running_mean * bn.weight / std  # (2c,)
+
+        # ---- Step 2: apply Conv1x1 (2c->c) to collapse the expanded dim ----
+        # merged_w[i, k, h, w] = sum_j  W1[i, j] * k_fused[j, k, h, w]
+        # merged_b[i]          = sum_j  W1[i, j] * b_fused[j]  +  b1[i]
+        W1 = conv1x1.weight[:, :, 0, 0]   # (c, 2c)  – squeeze spatial dims
+        b1 = conv1x1.bias                 # (c,)
+
+        merged_w = torch.einsum('ij,jkhw->ikhw', W1, k_fused)  # (c, c, 3, 3)
+        merged_b = W1 @ b_fused + b1                             # (c,)
+
+        return merged_w, merged_b
 
     def reparameterize(self):
-        """Merge all branches into a single 3×3 Conv and switch to deployed mode.
+        """Merge all branches into a single 3x3 Conv and switch to deployed mode.
 
         After calling this method the module no longer holds the original
         branch parameters. This is irreversible.
@@ -89,23 +106,30 @@ class RepSRBlock(nn.Module):
         if self.deployed:
             return
 
-        # 3x3 branch
-        k3, b3 = self._fuse_conv_bn(self.branch_3x3[0], self.branch_3x3[1])
-        # 1x1 branch – pad to 3x3
-        k1, b1 = self._fuse_conv_bn(self.branch_1x1[0], self.branch_1x1[1])
-        k1 = F.pad(k1, [1, 1, 1, 1])
-        # Identity branch
-        kid, bid = self._fuse_identity_bn(self.branch_id)
+        c = self.num_feat
+        dtype = self.branch1_3x3.weight.dtype
+        device = self.branch1_3x3.weight.device
 
-        final_weight = k3 + k1 + kid
-        final_bias = b3 + b1 + bid
+        # Fuse both expanded branches
+        k1, b1 = self._fuse_branch(self.branch1_3x3, self.branch1_bn, self.branch1_1x1)
+        k2, b2 = self._fuse_branch(self.branch2_3x3, self.branch2_bn, self.branch2_1x1)
 
-        self.rep_conv = nn.Conv2d(self.num_feat, self.num_feat, 3, 1, 1)
+        # Identity branch: 3x3 kernel with 1.0 at each diagonal center
+        k_id = torch.zeros(c, c, 3, 3, dtype=dtype, device=device)
+        for i in range(c):
+            k_id[i, i, 1, 1] = 1.0
+        b_id = torch.zeros(c, dtype=dtype, device=device)
+
+        final_weight = k1 + k2 + k_id
+        final_bias   = b1 + b2 + b_id
+
+        self.rep_conv = nn.Conv2d(c, c, 3, 1, 1)
         self.rep_conv.weight.data = final_weight
-        self.rep_conv.bias.data = final_bias
+        self.rep_conv.bias.data   = final_bias
 
-        # Remove training-only parameters
-        del self.branch_3x3, self.branch_1x1, self.branch_id
+        # Remove training-only parameters to save memory
+        del self.branch1_3x3, self.branch1_bn, self.branch1_1x1
+        del self.branch2_3x3, self.branch2_bn, self.branch2_1x1
 
         self.deployed = True
 
