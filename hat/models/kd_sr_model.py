@@ -20,10 +20,10 @@ YAML keys consumed by this model (under `train:`):
   teacher_feat_channels: 64   # channels at teacher's conv_before_upsample output
   student_feat_channels: 64   # channels at student's conv_body output
 
-YAML keys for tiling (under root level, same as HATModel):
+YAML keys for tiling (under root level):
   tile:
-    tile_size: 256
-    tile_pad: 32
+    patch_size: 256    # LR tile spatial size
+    overlap_size: 32   # LR overlap between adjacent tiles
 """
 
 import math
@@ -43,72 +43,124 @@ from tqdm import tqdm
 from os import path as osp
 
 
-def _tile_forward(model, img, tile_size, tile_pad, scale):
-    """Tile an image, run model on each tile, and stitch output.
+def _make_blend_weights(size: int, overlap: int, device) -> torch.Tensor:
+    """Build a 2-D linear-ramp blending weight mask of shape (size, size).
+
+    Values ramp from ``1/(fade+1)`` at the outermost ``fade`` pixels to
+    1 in the central safe zone, where ``fade = max(1, overlap // 2)``.
+    Weights are always > 0, avoiding division-by-zero when the accumulated
+    weight map is inverted.
 
     Args:
-        model (nn.Module): Forward-callable model.
-        img (Tensor): (B, C, H, W) input tensor (already padded if needed).
-        tile_size (int): Tile spatial size.
-        tile_pad (int): Overlap padding around each tile.
+        size (int): Spatial size of the HR patch (patch_size * scale).
+        overlap (int): HR-space overlap (overlap_size * scale).
+        device: Target device.
+
+    Returns:
+        Tensor: (size, size) float32 weight mask.
+    """
+    fade = max(1, overlap // 2)
+    w = torch.ones(size, dtype=torch.float32, device=device)
+    if size > 2 * fade:
+        ramp = torch.linspace(
+            1.0 / (fade + 1), float(fade) / (fade + 1), fade, device=device
+        )
+        w[:fade] = ramp
+        w[size - fade:] = ramp.flip(0)
+    return w.unsqueeze(0) * w.unsqueeze(1)   # outer product -> (size, size)
+
+
+def tiled_inference(model: nn.Module,
+                    lq: torch.Tensor,
+                    patch_size: int,
+                    overlap: int,
+                    scale: int) -> torch.Tensor:
+    """Tile-based SR inference with linear-blend stitching.
+
+    Handles arbitrary input sizes by:
+      1. Reflection-padding the LR input so its dimensions fit the tile grid.
+      2. Splitting into overlapping LR tiles (stride = patch_size - overlap).
+      3. Running ``model`` on each tile to obtain HR tiles.
+      4. Accumulating HR tiles weighted by a 2-D linear-ramp mask (higher
+         weight in the centre, lower at the overlap borders).
+      5. Dividing by the accumulated weight map to normalise.
+      6. Cropping the output to the exact target size (H*scale, W*scale).
+
+    The LR overlap ``overlap`` maps to ``overlap * scale`` in HR space.
+    The blending mask tapers the border region of each HR tile so that
+    overlapping contributions merge seamlessly without stitching artefacts.
+
+    Args:
+        model (nn.Module): SR model (no_grad applied internally).
+        lq (Tensor): (B, C, H, W) LR input tensor.
+        patch_size (int): LR tile spatial size.
+        overlap (int): LR-space overlap between adjacent tiles.
         scale (int): SR upscale factor.
 
     Returns:
-        Tensor: (B, C, H*scale, W*scale) stitched output.
+        Tensor: (B, C, H*scale, W*scale) stitched HR output.
     """
-    batch, channel, height, width = img.shape
-    output_height = height * scale
-    output_width = width * scale
-    output = img.new_zeros((batch, channel, output_height, output_width))
+    B, C, H, W = lq.shape
+    stride = patch_size - overlap
 
-    tiles_x = math.ceil(width / tile_size)
-    tiles_y = math.ceil(height / tile_size)
+    # ---- Compute reflection padding to align image to tile grid ----------
+    def _pad_len(size: int) -> int:
+        if size <= patch_size:
+            return patch_size - size           # ensure at least one full tile
+        remainder = (size - patch_size) % stride
+        return (stride - remainder) % stride   # round up to next tile boundary
 
-    for y in range(tiles_y):
-        for x in range(tiles_x):
-            ofs_x = x * tile_size
-            ofs_y = y * tile_size
+    pad_h = _pad_len(H)
+    pad_w = _pad_len(W)
+    # reflect mode requires pad < dimension; fall back to replicate when padding
+    # equals or exceeds the image size (e.g. input smaller than patch_size).
+    pad_mode = 'reflect' if pad_h < H and pad_w < W else 'replicate'
+    lq_pad = F.pad(lq, (0, pad_w, 0, pad_h), mode=pad_mode)
+    _, _, H_pad, W_pad = lq_pad.shape
 
-            input_start_x = ofs_x
-            input_end_x = min(ofs_x + tile_size, width)
-            input_start_y = ofs_y
-            input_end_y = min(ofs_y + tile_size, height)
+    # ---- Build tile starting positions (LR space) ------------------------
+    ys = list(range(0, H_pad - patch_size + 1, stride))
+    xs = list(range(0, W_pad - patch_size + 1, stride))
+    if ys[-1] + patch_size < H_pad:     # safety: cover the last row
+        ys.append(H_pad - patch_size)
+    if xs[-1] + patch_size < W_pad:     # safety: cover the last column
+        xs.append(W_pad - patch_size)
 
-            input_start_x_pad = max(input_start_x - tile_pad, 0)
-            input_end_x_pad = min(input_end_x + tile_pad, width)
-            input_start_y_pad = max(input_start_y - tile_pad, 0)
-            input_end_y_pad = min(input_end_y + tile_pad, height)
+    # ---- Accumulators in HR space ----------------------------------------
+    hr_patch = patch_size * scale
+    out_H = H_pad * scale
+    out_W = W_pad * scale
 
-            input_tile_width = input_end_x - input_start_x
-            input_tile_height = input_end_y - input_start_y
+    output: torch.Tensor | None = None
+    weight: torch.Tensor | None = None
 
-            input_tile = img[
-                :, :,
-                input_start_y_pad:input_end_y_pad,
-                input_start_x_pad:input_end_x_pad
-            ]
+    blend = _make_blend_weights(hr_patch, overlap * scale, lq.device)
+    blend = blend.unsqueeze(0).unsqueeze(0)   # (1, 1, hr_patch, hr_patch)
+
+    # ---- Forward each tile and accumulate --------------------------------
+    model.eval()
+    for y in ys:
+        for x in xs:
+            tile = lq_pad[:, :, y:y + patch_size, x:x + patch_size]
 
             with torch.no_grad():
-                output_tile = model(input_tile)
+                sr_tile = model(tile)          # (B, C_out, hr_patch, hr_patch)
 
-            output_start_x = input_start_x * scale
-            output_end_x = input_end_x * scale
-            output_start_y = input_start_y * scale
-            output_end_y = input_end_y * scale
+            if output is None:
+                C_out = sr_tile.shape[1]
+                output = lq.new_zeros(B, C_out, out_H, out_W)
+                weight = lq.new_zeros(1, 1, out_H, out_W)
 
-            output_start_x_tile = (input_start_x - input_start_x_pad) * scale
-            output_end_x_tile = output_start_x_tile + input_tile_width * scale
-            output_start_y_tile = (input_start_y - input_start_y_pad) * scale
-            output_end_y_tile = output_start_y_tile + input_tile_height * scale
+            y_hr = y * scale
+            x_hr = x * scale
+            output[:, :, y_hr:y_hr + hr_patch, x_hr:x_hr + hr_patch] += (
+                sr_tile * blend
+            )
+            weight[:, :, y_hr:y_hr + hr_patch, x_hr:x_hr + hr_patch] += blend
 
-            output[:, :, output_start_y:output_end_y, output_start_x:output_end_x] = \
-                output_tile[
-                    :, :,
-                    output_start_y_tile:output_end_y_tile,
-                    output_start_x_tile:output_end_x_tile
-                ]
-
-    return output
+    # ---- Normalise and crop to original target resolution ----------------
+    output = output / weight.clamp(min=1e-8)
+    return output[:, :, :H * scale, :W * scale]
 
 
 @MODEL_REGISTRY.register()
@@ -258,6 +310,24 @@ class KDSRModel(SRModel):
         # has been created.
 
     # ---------------------------------------------------------------------- #
+    # Data feeding                                                             #
+    # ---------------------------------------------------------------------- #
+
+    def feed_data(self, data):
+        """Feed a batch to the model.
+
+        Accepts data dicts both with and without a ``'gt'`` key so that
+        ``SingleLRDataset`` (LR-only) and paired datasets can both be used.
+        Stale ``self.gt`` from a previous iteration is cleared when the
+        current batch has no GT, preventing cross-iteration leakage.
+        """
+        self.lq = data['lq'].to(self.device)
+        if 'gt' in data:
+            self.gt = data['gt'].to(self.device)
+        elif hasattr(self, 'gt'):
+            del self.gt   # clear stale GT from any previous paired batch
+
+    # ---------------------------------------------------------------------- #
     # Hook registration                                                        #
     # ---------------------------------------------------------------------- #
 
@@ -361,11 +431,11 @@ class KDSRModel(SRModel):
                 pad_w = (window_size - w % window_size) % window_size
                 lq_pad = F.pad(lq, (0, pad_w, 0, pad_h), 'reflect')
 
-                pseudo_gt = _tile_forward(
+                pseudo_gt = tiled_inference(
                     self.net_teacher,
                     lq_pad,
-                    self.opt['tile']['tile_size'],
-                    self.opt['tile']['tile_pad'],
+                    self.opt['tile']['patch_size'],
+                    self.opt['tile']['overlap_size'],
                     self.opt['scale']
                 )
                 # Remove padding
@@ -499,16 +569,15 @@ class KDSRModel(SRModel):
     def tile_process(self):
         """Tile-based inference for the student model.
 
-        Uses parameters from opt['tile']['tile_size'] and
-        opt['tile']['tile_pad'].
+        Uses parameters from opt['tile']['patch_size'] and
+        opt['tile']['overlap_size'].
         """
         model = self.net_g_ema if hasattr(self, 'net_g_ema') else self.net_g
-        model.eval()
-        self.output = _tile_forward(
+        self.output = tiled_inference(
             model,
             self.img,
-            self.opt['tile']['tile_size'],
-            self.opt['tile']['tile_pad'],
+            self.opt['tile']['patch_size'],
+            self.opt['tile']['overlap_size'],
             self.opt['scale']
         )
 

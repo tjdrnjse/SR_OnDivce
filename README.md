@@ -48,12 +48,10 @@ pip install mamba-ssm einops
 ```
 HAT/
 ├── datasets/
-│   ├── DF2K/
-│   │   ├── DF2K_HR_sub/          # HR sub-images (800x800 -> 480x480 patches)
-│   │   └── DF2K_bicx4_sub/       # LR sub-images (bicubic x4 downsampled)
+│   ├── my_lr_images/             # Real LR images (any resolution, no HR needed)
 │   ├── Set5/
-│   │   ├── GTmod4/               # HR ground-truth
-│   │   └── LRbicx4/              # LR bicubic inputs
+│   │   ├── GTmod4/               # HR ground-truth (validation only)
+│   │   └── LRbicx4/              # LR bicubic inputs (validation)
 │   └── Set14/
 │       ├── GTmod4/
 │       └── LRbicx4/
@@ -62,21 +60,24 @@ HAT/
         └── HAT_SRx4_ImageNet-pretrain.pth   # teacher checkpoint
 ```
 
-### Generating DF2K sub-images (if not already done)
+> **No HR images required for KD training.**
+> `SingleLRDataset` loads LR images as-is and the frozen teacher generates
+> Pseudo-GT HR patches on-the-fly during training.
 
-```bash
-# Generate HR sub-images (stride 240, size 480)
-python basicsr/scripts/extract_subimages.py \
-    --input  datasets/DF2K/DF2K_HR \
-    --output datasets/DF2K/DF2K_HR_sub \
-    --n_thread 20
+### Obtaining real LR images
 
-# Generate LR sub-images
-python basicsr/scripts/extract_subimages.py \
-    --input  datasets/DF2K/DF2K_LR_bicubic/X4 \
-    --output datasets/DF2K/DF2K_bicx4_sub \
-    --n_thread 20
-```
+Any collection of natural LR images works. Example sources:
+
+- Extract LR sub-images from an existing dataset (e.g. DF2K LR bicubic):
+
+  ```bash
+  python basicsr/scripts/extract_subimages.py \
+      --input  datasets/DF2K/DF2K_LR_bicubic/X4 \
+      --output datasets/my_lr_images \
+      --n_thread 20
+  ```
+
+- Or simply point `dataroot_lq` at your own folder of LR `.png` / `.jpg` files.
 
 Download pretrained teacher checkpoints from the official HAT repo:
 https://github.com/XPixelGroup/HAT#pretrained-models
@@ -160,15 +161,64 @@ train:
   teacher_feat_channels: 64   # fixed: HAT / MambaIRv2 conv_before_upsample = 64
 ```
 
-### 3-e. Tiling (`tile`)
+### 3-e. SingleLRDataset (LR-only training)
 
-Enable tiling for GPU-memory-limited validation or inference:
+Use `SingleLRDataset` when you have only LR images and want the teacher to
+generate Pseudo-GT on-the-fly.  **No bicubic downsampling is applied — the
+LR images are used at their native resolution.**
+
+```yaml
+datasets:
+  train:
+    name: LR_train
+    type: SingleLRDataset          # <-- use this instead of ImageNetPairedDataset
+    dataroot_lq: datasets/my_lr_images   # folder of real LR images
+    io_backend:
+      type: disk
+
+    lq_patch_size: 64   # random-crop size in LR space (no resize)
+    use_hflip: true
+    use_rot: true
+
+    # Remove / omit these keys (they are NOT needed):
+    #   dataroot_gt: ...         (no HR images required)
+    #   gt_size: ...             (no resize)
+    #   scale: ...               (no downsampling)
+```
+
+**Key differences from `ImageNetPairedDataset`:**
+
+| Feature | `ImageNetPairedDataset` | `SingleLRDataset` |
+|---|---|---|
+| Input | HR images (downsampled to LR on-the-fly) | Real LR images |
+| Resize | Bicubic downscale by 1/scale | **None** |
+| GT returned | Yes (HR image) | No (teacher generates it) |
+| `dataroot_hr` | Required | Not used |
+
+### 3-f. Tiling (`tile`)
+
+Enable tiling for GPU-memory-limited **validation or inference**.
+Tiling is **not** used during training (training always works on small patches).
 
 ```yaml
 tile:
-  tile_size: 256   # spatial tile size in pixels (multiple of window_size=16)
-  tile_pad: 32     # overlap padding between adjacent tiles (also multiple of 16)
+  patch_size: 256     # LR tile spatial size fed to the model
+  overlap_size: 32    # LR-space overlap between adjacent tiles
+                      # HR overlap = overlap_size * scale
 ```
+
+**How the stitching works (linear blending):**
+
+```
+LR overlap:  overlap_size  pixels
+HR overlap:  overlap_size * scale  pixels
+Blend fade:  (overlap_size * scale) / 2  pixels at each tile border
+```
+
+Each HR output tile is weighted by a 2-D linear-ramp mask (weight = 1 in
+the centre, linearly tapers to ~0 at the border).  Accumulated tiles are
+normalised by the summed weight map, producing seamless blending without
+visible seams even at tile boundaries.
 
 Remove (or comment out) the `tile:` block to process images in one pass.
 
@@ -435,7 +485,8 @@ Set `type: MambaIRv2` in `network_teacher:` to use it as the teacher.
 |------|------|
 | `hat/archs/rep_sr_arch.py` | RepSR student architecture |
 | `hat/archs/mambairv2_arch.py` | MambaIRv2 teacher architecture |
-| `hat/models/kd_sr_model.py` | KD training + validation model |
+| `hat/data/single_lr_dataset.py` | LR-only dataset (no resize, teacher generates GT) |
+| `hat/models/kd_sr_model.py` | KD training + tiled inference model |
 | `options/train/train_KD_RepSR_x4.yml` | Training configuration |
 | `options/test/test_KD_RepSR_x4.yml` | Test / inference configuration |
 | `scripts/convert_rep_sr.py` | Reparameterization & export script |
