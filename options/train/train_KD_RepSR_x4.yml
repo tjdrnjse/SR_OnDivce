@@ -176,7 +176,8 @@ train:
 # ============================================================
 val:
   val_freq: !!float 5e3
-  save_img: false
+  save_img: true          # save LQ / teacher / student triplets
+  save_img_num: 4         # how many triplets to save per validation round
   pbar: false
 
   metrics:

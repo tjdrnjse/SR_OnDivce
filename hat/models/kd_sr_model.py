@@ -599,6 +599,11 @@ class KDSRModel(SRModel):
         if with_metrics:
             self.metric_results = {metric: 0 for metric in self.metric_results}
 
+        # Maximum number of (lq / teacher / student) image triplets to save
+        # per validation round.  Set via val.save_img_num in YAML (default 4).
+        save_img_num = int(self.opt['val'].get('save_img_num', 4))
+        n_saved = 0
+
         metric_data = {}
         if use_pbar:
             pbar = tqdm(total=len(dataloader), unit='image')
@@ -615,36 +620,56 @@ class KDSRModel(SRModel):
             self.post_process()
 
             visuals = self.get_current_visuals()
-            sr_img = tensor2img([visuals['result']])
+            sr_img = tensor2img([visuals['result']])    # student output
             metric_data['img'] = sr_img
             if 'gt' in visuals:
                 gt_img = tensor2img([visuals['gt']])
                 metric_data['img2'] = gt_img
                 del self.gt
 
+            # -------------------------------------------------------------- #
+            # Save triplet: LQ (upsampled) / Teacher output / Student output  #
+            # Saved for the first `save_img_num` images per validation round. #
+            # -------------------------------------------------------------- #
+            if save_img and n_saved < save_img_num:
+                scale = self.opt['scale']
+
+                # LQ: bilinear upsample to HR resolution for side-by-side compare
+                lq_up = F.interpolate(
+                    self.lq,
+                    scale_factor=scale,
+                    mode='bilinear',
+                    align_corners=False,
+                )
+                lq_img = tensor2img([lq_up])
+
+                # Teacher pseudo-GT (no grad, handles window_size padding)
+                teacher_out = self._run_teacher(self.lq)
+                teacher_img = tensor2img([teacher_out])
+
+                # Build save directory
+                if self.opt['is_train']:
+                    save_dir = osp.join(
+                        self.opt['path']['visualization'],
+                        dataset_name,
+                        f'iter_{current_iter:08d}',
+                    )
+                else:
+                    suffix = self.opt['val'].get('suffix', self.opt['name'])
+                    save_dir = osp.join(
+                        self.opt['path']['visualization'],
+                        dataset_name,
+                        suffix,
+                    )
+
+                imwrite(lq_img,      osp.join(save_dir, f'{img_name}_lq.png'))
+                imwrite(teacher_img, osp.join(save_dir, f'{img_name}_teacher.png'))
+                imwrite(sr_img,      osp.join(save_dir, f'{img_name}_student.png'))
+                n_saved += 1
+
             del self.lq
             del self.output
             torch.cuda.empty_cache()
-
-            if save_img:
-                if self.opt['is_train']:
-                    save_img_path = osp.join(
-                        self.opt['path']['visualization'], img_name,
-                        f'{img_name}_{current_iter}.png'
-                    )
-                else:
-                    suffix = self.opt['val'].get('suffix', '')
-                    if suffix:
-                        save_img_path = osp.join(
-                            self.opt['path']['visualization'], dataset_name,
-                            f'{img_name}_{suffix}.png'
-                        )
-                    else:
-                        save_img_path = osp.join(
-                            self.opt['path']['visualization'], dataset_name,
-                            f'{img_name}_{self.opt["name"]}.png'
-                        )
-                imwrite(sr_img, save_img_path)
 
             if with_metrics:
                 for name, opt_ in self.opt['val']['metrics'].items():
