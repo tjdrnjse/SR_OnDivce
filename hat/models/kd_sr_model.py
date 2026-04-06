@@ -547,6 +547,11 @@ class KDSRModel(SRModel):
             )
         )
 
+        # Cache first-sample visuals for TensorBoard (detached, no grad)
+        self._vis_lq      = self.lq[:1].detach()
+        self._vis_student = student_out[:1].detach()
+        self._vis_teacher = pseudo_gt[:1].detach()
+
     # ---------------------------------------------------------------------- #
     # Validation / Inference overrides (student only)                          #
     # ---------------------------------------------------------------------- #
@@ -665,6 +670,26 @@ class KDSRModel(SRModel):
                 imwrite(lq_img,      osp.join(save_dir, f'{img_name}_lq.png'))
                 imwrite(teacher_img, osp.join(save_dir, f'{img_name}_teacher.png'))
                 imwrite(sr_img,      osp.join(save_dir, f'{img_name}_student.png'))
+
+                # Also log to TensorBoard (uses the same tensors, already computed)
+                if tb_logger is not None:
+                    tag_prefix = f'val/{dataset_name}/{img_name}'
+                    tb_logger.add_image(
+                        f'{tag_prefix}_lq_bicubic',
+                        self._to_tb_image(lq_up),
+                        global_step=current_iter
+                    )
+                    tb_logger.add_image(
+                        f'{tag_prefix}_teacher',
+                        self._to_tb_image(teacher_out),
+                        global_step=current_iter
+                    )
+                    tb_logger.add_image(
+                        f'{tag_prefix}_student',
+                        self._to_tb_image(visuals['result']),
+                        global_step=current_iter
+                    )
+
                 n_saved += 1
 
             del self.lq
@@ -689,6 +714,69 @@ class KDSRModel(SRModel):
                     self.metric_results[metric], current_iter
                 )
             self._log_validation_metric_values(current_iter, dataset_name, tb_logger)
+
+    # ---------------------------------------------------------------------- #
+    # TensorBoard visual logging                                               #
+    # ---------------------------------------------------------------------- #
+
+    @staticmethod
+    def _to_tb_image(tensor: torch.Tensor, max_size: int = 256) -> torch.Tensor:
+        """Convert a model output tensor to a TensorBoard-compatible image.
+
+        Args:
+            tensor: (1, C, H, W) float tensor in [0, 1] range.
+            max_size: Resize longest side to this if image is larger.
+
+        Returns:
+            (C, H', W') float tensor in [0, 1], clipped.
+        """
+        img = tensor[0].clamp(0.0, 1.0).float()   # (C, H, W)
+        _, H, W = img.shape
+        if max(H, W) > max_size:
+            scale = max_size / max(H, W)
+            new_h = max(1, int(H * scale))
+            new_w = max(1, int(W * scale))
+            img = F.interpolate(
+                img.unsqueeze(0),
+                size=(new_h, new_w),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0)
+        return img
+
+    def log_train_visuals(self, tb_logger, current_iter: int):
+        """Log training sample visuals (LQ / teacher pseudo-GT / student) to TB.
+
+        Called from ``hat/train.py`` every ``tb_train_vis_freq`` iterations.
+        Relies on ``self._vis_lq``, ``self._vis_teacher``, ``self._vis_student``
+        cached at the end of the most recent ``optimize_parameters`` call.
+        """
+        if tb_logger is None:
+            return
+        if not (hasattr(self, '_vis_lq') and hasattr(self, '_vis_teacher')
+                and hasattr(self, '_vis_student')):
+            return
+
+        scale = self.opt['scale']
+        lq_up = F.interpolate(
+            self._vis_lq, scale_factor=scale, mode='bilinear', align_corners=False
+        )
+
+        tb_logger.add_image(
+            'train/lq_bicubic',
+            self._to_tb_image(lq_up),
+            global_step=current_iter
+        )
+        tb_logger.add_image(
+            'train/teacher_pseudo_gt',
+            self._to_tb_image(self._vis_teacher),
+            global_step=current_iter
+        )
+        tb_logger.add_image(
+            'train/student_output',
+            self._to_tb_image(self._vis_student),
+            global_step=current_iter
+        )
 
     # ---------------------------------------------------------------------- #
     # Saving                                                                   #

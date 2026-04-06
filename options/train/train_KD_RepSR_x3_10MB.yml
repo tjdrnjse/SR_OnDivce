@@ -204,6 +204,7 @@ logger:
   print_freq: 100
   save_checkpoint_freq: !!float 5e3
   use_tb_logger: true
+  tb_train_vis_freq: 500    # log training sample images to TensorBoard every N iters
   wandb:
     project: ~
     resume_id: ~

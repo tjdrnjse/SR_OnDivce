@@ -52,8 +52,9 @@ def _init_tb_loggers(opt):
         init_wandb_logger(opt)
     tb_logger = None
     if opt['logger'].get('use_tb_logger') and 'debug' not in opt['name']:
+        # Store TB logs inside the experiment folder for easy co-location.
         tb_logger = init_tb_logger(
-            log_dir=osp.join(opt['root_path'], 'tb_logger', opt['name']))
+            log_dir=osp.join(opt['path']['experiments_root'], 'tb_logger'))
     return tb_logger
 
 
@@ -202,7 +203,7 @@ def train_pipeline(root_path):
                 and 'debug' not in opt['name']
                 and opt['rank'] == 0):
             mkdir_and_rename(
-                osp.join(opt['root_path'], 'tb_logger', opt['name']))
+                osp.join(opt['path']['experiments_root'], 'tb_logger'))
 
     copy_opt_file(args.opt, opt['path']['experiments_root'])
 
@@ -280,6 +281,12 @@ def train_pipeline(root_path):
 
             if current_iter == 1:
                 msg_logger.reset_start_time()
+
+            # Log training sample visuals to TensorBoard
+            train_vis_freq = opt['logger'].get('tb_train_vis_freq', 500)
+            if (tb_logger is not None
+                    and current_iter % train_vis_freq == 0):
+                model.log_train_visuals(tb_logger, current_iter)
 
             if current_iter % opt['logger']['print_freq'] == 0:
                 log_vars = {'epoch': epoch, 'iter': current_iter}
