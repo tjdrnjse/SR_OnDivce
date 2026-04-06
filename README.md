@@ -17,7 +17,8 @@ A **turn-key Knowledge Distillation (KD) Super-Resolution** framework built on t
 4. [KD Training](#4-kd-training)
 5. [Convert to Deployment Weights](#5-convert-to-deployment-weights)
 6. [Final Inference / Test](#6-final-inference--test)
-7. [Architecture Notes](#7-architecture-notes)
+7. [Teacher Model Standalone Testing (Tiling Inference)](#7-teacher-model-standalone-testing-tiling-inference)
+8. [Architecture Notes](#8-architecture-notes)
 
 ---
 
@@ -366,7 +367,173 @@ tile:
 
 ---
 
-## 7. End-to-End Experiment Example (x4 SR, HAT Teacher)
+## 7. Teacher Model Standalone Testing (Tiling Inference)
+
+Use `scripts/inference_teacher_tiling.py` to evaluate a Teacher model
+(HAT, MambaIRv2, etc.) **independently** -- without loading the student or
+any KD components.
+
+### How the tiling works (crop-and-paste)
+
+```
+LR image (arbitrary size)
+  |
+  v
+Reflection-pad to fit tile grid  (stride = tile_size - tile_overlap)
+  |
+  +-- tile (0,0) --> Teacher --> HR tile --> crop c px per side --> paste
+  +-- tile (0,1) --> Teacher --> HR tile --> crop c px per side --> paste
+  ...
+  v
+Crop away the padding region  -->  Final HR image (W*scale x H*scale)
+
+  c = (tile_overlap * scale) // 2   [HR border crop per side]
+```
+
+Cropping the border of each HR tile and pasting only the safe central region
+eliminates boundary artifacts.  For edge tiles (first / last row / column),
+the outer boundary is NOT cropped to preserve full image content.
+
+---
+
+### 7-a. HAT SR x3 (ImageNet Pretrained)
+
+**YAML** (`options/inference/teacher_hat_x3.yml`):
+
+```yaml
+scale: 3
+
+tile_size: 256      # LR tile size
+tile_overlap: 32    # LR overlap  -->  HR crop = (32 * 3) // 2 = 48 px per side
+
+input_dir:  datasets/my_lr_images
+output_dir: results/teacher_hat_x3
+device:     cuda
+
+network_t:
+  type: HAT
+  upscale: 3
+  in_chans: 3
+  img_size: 64
+  window_size: 16
+  compress_ratio: 3
+  squeeze_factor: 30
+  conv_scale: 0.01
+  overlap_ratio: 0.5
+  img_range: 1.
+  depths: [6, 6, 6, 6, 6, 6]
+  embed_dim: 180
+  num_heads: [6, 6, 6, 6, 6, 6]
+  mlp_ratio: 2
+  upsampler: 'pixelshuffle'
+  resi_connection: '1conv'
+
+path:
+  pretrain_network_t: experiments/pretrained_models/HAT_SRx3_ImageNet-pretrain.pth
+```
+
+**Run:**
+
+```bash
+# Using the ready-made YAML
+python scripts/inference_teacher_tiling.py \
+    --opt   options/inference/teacher_hat_x3.yml \
+    --input datasets/my_lr_images \
+    --output results/teacher_hat_x3
+
+# Override device or suffix on the fly
+python scripts/inference_teacher_tiling.py \
+    --opt    options/inference/teacher_hat_x3.yml \
+    --input  datasets/Set5/LRbicx3 \
+    --output results/teacher_hat_x3/Set5 \
+    --device cuda:0 \
+    --suffix _hat_x3
+```
+
+Output: `results/teacher_hat_x3/<image_name>_SR.png`
+
+---
+
+### 7-b. MambaIRv2 SR Small x3
+
+> Reference: https://github.com/csguoh/MambaIR
+>
+> Requires: `pip install mamba-ssm einops` (CUDA GPU + matching toolkit)
+
+**YAML** (`options/inference/teacher_mambairv2_small_x3.yml`):
+
+```yaml
+scale: 3
+
+tile_size: 256
+tile_overlap: 32    # HR crop = (32 * 3) // 2 = 48 px per side
+
+input_dir:  datasets/my_lr_images
+output_dir: results/teacher_mambairv2_small_x3
+device:     cuda
+
+# MambaIRv2 Small: embed_dim=60, 4-stage, depths=[6,6,6,6]
+network_t:
+  type: MambaIRv2
+  upscale: 3
+  img_size: 64
+  in_chans: 3
+  embed_dim: 60
+  d_state: 8
+  depths: [6, 6, 6, 6]
+  num_heads: [4, 4, 4, 4]
+  window_size: 16
+  inner_rank: 32
+  num_tokens: 64
+  convffn_kernel_size: 5
+  mlp_ratio: 2.
+  img_range: 1.
+  upsampler: 'pixelshuffle'
+  resi_connection: '1conv'
+
+path:
+  pretrain_network_t: experiments/pretrained_models/MambaIRv2_Small_SRx3.pth
+```
+
+**Run:**
+
+```bash
+python scripts/inference_teacher_tiling.py \
+    --opt   options/inference/teacher_mambairv2_small_x3.yml \
+    --input datasets/my_lr_images \
+    --output results/teacher_mambairv2_small_x3
+```
+
+---
+
+### 7-c. CLI reference
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--opt`    | (required) | Path to inference YAML |
+| `--input`  | YAML `input_dir` | LR image folder |
+| `--output` | YAML `output_dir` | Output folder for SR images |
+| `--device` | YAML `device` / auto | `cuda`, `cuda:1`, `cpu` |
+| `--suffix` | `_SR` | Suffix appended to each output filename stem |
+
+---
+
+### 7-d. YAML key reference
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `scale` | SR upscale factor | `4` |
+| `tile_size` | LR tile spatial size | `256` |
+| `tile_overlap` | LR overlap between adjacent tiles | `32` |
+| `input_dir` | Folder of LR input images | — |
+| `output_dir` | Folder where SR PNGs are saved | `results/teacher_inference` |
+| `device` | Compute device | auto-detect |
+| `network_t` | Teacher architecture dict (`type` + params) | — |
+| `path.pretrain_network_t` | Teacher checkpoint path | — |
+
+---
+
+## 8. End-to-End Experiment Example (x4 SR, HAT Teacher)
 
 아래는 HAT teacher + RepSR student, scale×4, GPU 1장 기준으로 처음부터 끝까지 실행하는 전체 명령어 예시입니다.
 
@@ -478,7 +645,7 @@ python hat/test.py -opt options/test/test_KD_RepSR_x4.yml
 
 ---
 
-## 8. Architecture Notes
+## 9. Architecture Notes
 
 ### RepSR
 
@@ -530,6 +697,9 @@ Set `type: MambaIRv2` in `network_teacher:` to use it as the teacher.
 | `options/train/train_KD_RepSR_x4.yml` | Training configuration |
 | `options/test/test_KD_RepSR_x4.yml` | Test / inference configuration |
 | `scripts/convert_rep_sr.py` | Reparameterization & export script |
+| `scripts/inference_teacher_tiling.py` | Teacher standalone SR with crop-and-paste tiling |
+| `options/inference/teacher_hat_x3.yml` | Example YAML for HAT x3 teacher inference |
+| `options/inference/teacher_mambairv2_small_x3.yml` | Example YAML for MambaIRv2 Small x3 teacher inference |
 
 ---
 

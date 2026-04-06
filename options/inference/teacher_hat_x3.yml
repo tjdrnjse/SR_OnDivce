@@ -1,0 +1,45 @@
+# ============================================================
+# Teacher Standalone Inference: HAT SR x3 (ImageNet Pretrained)
+# ============================================================
+# Usage:
+#   python scripts/inference_teacher_tiling.py \
+#       --opt   options/inference/teacher_hat_x3.yml \
+#       --input datasets/my_lr_images \
+#       --output results/teacher_hat_x3
+# ============================================================
+
+# ---- SR scale -----------------------------------------------
+scale: 3
+
+# ---- Tiling settings ----------------------------------------
+tile_size: 256      # LR tile spatial size fed to the model
+tile_overlap: 32    # LR-space overlap between tiles
+                    # HR crop per side = (tile_overlap * scale) // 2 = 48 px
+
+# ---- I/O (can be overridden via CLI --input / --output) -----
+input_dir:  datasets/my_lr_images
+output_dir: results/teacher_hat_x3
+device:     cuda   # cuda | cpu
+
+# ---- Teacher network (HAT x3) -------------------------------
+network_t:
+  type: HAT
+  upscale: 3
+  in_chans: 3
+  img_size: 64
+  window_size: 16
+  compress_ratio: 3
+  squeeze_factor: 30
+  conv_scale: 0.01
+  overlap_ratio: 0.5
+  img_range: 1.
+  depths: [6, 6, 6, 6, 6, 6]
+  embed_dim: 180
+  num_heads: [6, 6, 6, 6, 6, 6]
+  mlp_ratio: 2
+  upsampler: 'pixelshuffle'
+  resi_connection: '1conv'
+
+# ---- Teacher checkpoint -------------------------------------
+path:
+  pretrain_network_t: experiments/pretrained_models/HAT_SRx3_ImageNet-pretrain.pth
