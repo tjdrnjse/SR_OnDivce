@@ -356,21 +356,22 @@ class KDSRModel(SRModel):
     def _get_student_hook_layer(self):
         """Return the layer in the student from which to extract features.
 
-        For RepSR the feature hook point is `conv_body` which outputs
-        (B, num_feat, H, W) (or H/s2d, W/s2d when S2D is enabled).
+        Checks in priority order:
+          - ``conv_body``          : RepSR student  (B, num_feat, H_lr, W_lr)
+          - ``conv_before_upsample``: HAT-type student (B, 64, H_lr, W_lr)
         """
         student = self.net_g
         if hasattr(student, 'module'):
             student = student.module
 
-        for attr in ('conv_body',):
+        for attr in ('conv_body', 'conv_before_upsample'):
             layer = getattr(student, attr, None)
             if layer is not None:
                 return layer
 
         raise AttributeError(
-            'Cannot find `conv_body` in student model. '
-            'Please ensure the student architecture exposes this attribute.'
+            'Cannot find `conv_body` or `conv_before_upsample` in student model. '
+            'Please ensure the student architecture exposes one of these attributes.'
         )
 
     def _register_feature_hooks(self):
@@ -474,6 +475,16 @@ class KDSRModel(SRModel):
         # ---- Teacher: generate Pseudo-GT and capture teacher features -------
         # We need teacher features at training resolution (small patches),
         # so we run the teacher on lq directly (no tiling needed for patches).
+        # ---- Cross-scale validation -----------------------------------------
+        teacher_upscale = self.opt['network_teacher']['upscale']
+        student_upscale = self.opt['network_g']['upscale']
+        if teacher_upscale < student_upscale:
+            raise ValueError(
+                f'Teacher upscale ({teacher_upscale}x) is less than student '
+                f'upscale ({student_upscale}x). KD cannot be performed when '
+                'the teacher resolution is lower than the student resolution.'
+            )
+
         self.net_teacher.eval()
         with torch.no_grad():
             # Pad lq to window_size multiple for transformer teachers
@@ -486,14 +497,27 @@ class KDSRModel(SRModel):
             pad_w = (window_size - w % window_size) % window_size
             lq_padded = F.pad(self.lq, (0, pad_w, 0, pad_h), 'reflect')
             pseudo_gt_padded = self.net_teacher(lq_padded)
-            # Crop padding from pseudo_gt
+
+            # Crop padding using teacher_upscale (not student scale)
+            # pseudo_gt_padded: (B, C, (h+pad_h)*teacher_up, (w+pad_w)*teacher_up)
+            # After crop:       (B, C, h*teacher_up, w*teacher_up)
             _, _, h_out, w_out = pseudo_gt_padded.shape
-            scale = self.opt['scale']
             pseudo_gt = pseudo_gt_padded[
                 :, :,
-                :h_out - pad_h * scale,
-                :w_out - pad_w * scale
+                :h_out - pad_h * teacher_upscale,
+                :w_out - pad_w * teacher_upscale,
             ]
+
+            # Cross-scale: downsample pseudo_gt to student output resolution
+            # E.g. teacher x4 → pseudo_gt (H*4, W*4) → bicubic → (H*3, W*3)
+            if teacher_upscale > student_upscale:
+                pseudo_gt = F.interpolate(
+                    pseudo_gt,
+                    size=(h * student_upscale, w * student_upscale),
+                    mode='bicubic',
+                    align_corners=False,
+                    antialias=True,
+                )
             # teacher_feat is stored in self._teacher_feat by hook
 
         # teacher_feat shape: (B, 64, H_lr+pad_h, W_lr+pad_w) — includes padding
