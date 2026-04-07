@@ -170,6 +170,35 @@ def tensor_to_img_bgr(t: torch.Tensor) -> np.ndarray:
 # Tiling helpers
 # ---------------------------------------------------------------------------
 
+def _make_blend_weights(size: int, overlap: int, device) -> torch.Tensor:
+    """Build a 2-D linear-ramp blending weight mask of shape (size, size).
+
+    The central ``size - 2*fade`` pixels have weight 1.0.
+    The border ``fade = overlap // 2`` pixels ramp linearly from
+    ``1 / (fade + 1)`` (outermost edge) up to 1.0 (inner boundary).
+    All values are strictly > 0, so dividing by the accumulated weight map
+    never produces division-by-zero.
+
+    Args:
+        size (int):    HR-space tile side length (tile_size * upscale).
+        overlap (int): HR-space overlap between adjacent tiles
+                       (tile_overlap * upscale).
+        device:        Target device.
+
+    Returns:
+        Tensor: (size, size) float32 weight mask.
+    """
+    fade = max(1, overlap // 2)
+    w = torch.ones(size, dtype=torch.float32, device=device)
+    if size > 2 * fade:
+        ramp = torch.linspace(1.0 / (fade + 1), float(fade) / (fade + 1),
+                              fade, device=device)
+        w[:fade]        = ramp           # left / top edge ramps up
+        w[size - fade:] = ramp.flip(0)  # right / bottom edge ramps down
+    # 2-D mask: outer product of two 1-D ramps  (size, size)
+    return w.unsqueeze(0) * w.unsqueeze(1)
+
+
 def _pad_len(size: int, tile_size: int, stride: int) -> int:
     """Pixels to pad so the tile grid covers *size* exactly.
 
@@ -203,26 +232,33 @@ def tiled_sr(model: torch.nn.Module,
              upscale: int,
              window_size: int = 1,
              tile_batch_size: int = 16) -> torch.Tensor:
-    """Run SR inference with batched crop-and-paste tiling.
+    """Run SR inference with batched Linear-Blending (Feathering) tiling.
 
-    Optimisations over the naive sequential loop:
-      - **Tile batching**: all LR tiles are collected upfront and forwarded
-        through the model in mini-batches of ``tile_batch_size``, eliminating
-        GPU starvation caused by per-tile kernel launches.
-      - **BF16 autocast** (CUDA only): the model forward is wrapped in
-        ``torch.autocast(..., dtype=torch.bfloat16)`` so H100 tensor cores
-        are fully utilised.
-      - **FP32 canvas**: HR tiles are cast back to float32 before pasting to
-        avoid BF16 quantisation error accumulating in the output buffer.
+    Replaces the previous Crop-and-Paste approach with weight-accumulation
+    blending to eliminate mosaic/grid artifacts at tile boundaries:
+
+      output_canvas  +=  tile_hr  * blend_mask   (weighted accumulation)
+      weight_canvas  +=  blend_mask
+      output_final    =  output_canvas / clamp(weight_canvas, min=1e-8)
+
+    The 2-D blend mask linearly ramps from a small positive value at the
+    tile edge to 1.0 in the centre, so overlapping regions are merged
+    smoothly without visible seams.
+
+    Additional optimisations retained from the previous version:
+      - **Tile batching**: tiles are forwarded in mini-batches of
+        ``tile_batch_size`` to eliminate GPU starvation.
+      - **BF16 autocast** (CUDA only): H100 Tensor Cores are used for the
+        model forward; results are cast back to FP32 before accumulation.
 
     Args:
-        model:          Teacher SR model in eval mode on the correct device.
-        lq:             (1, C, H, W) LR input tensor in [0, 1], float32.
-        tile_size:      LR tile spatial size (e.g. 256).
-        tile_overlap:   LR-space overlap between adjacent tiles (e.g. 32).
-        upscale:        SR scale factor.
-        window_size:    Transformer window size for window-aligned padding.
-                        Pass 1 (default) to disable extra alignment padding.
+        model:           Teacher SR model in eval mode on the correct device.
+        lq:              (1, C, H, W) LR input tensor in [0, 1], float32.
+        tile_size:       LR tile spatial size (e.g. 256).
+        tile_overlap:    LR-space overlap between adjacent tiles (e.g. 32).
+        upscale:         SR scale factor.
+        window_size:     Transformer window size for window-aligned padding.
+                         Pass 1 (default) to disable extra alignment padding.
         tile_batch_size: Number of LR tiles forwarded per model call (default 16).
 
     Returns:
@@ -231,10 +267,6 @@ def tiled_sr(model: torch.nn.Module,
     _, C, H, W = lq.shape
     device = lq.device
     stride = tile_size - tile_overlap
-
-    # HR border crop per tile side: ensures adjacent safe regions abut exactly
-    #   c = (tile_overlap * upscale) / 2
-    c = (tile_overlap * upscale) // 2
 
     # ---- 1. Pad LR input to fit tile grid ------------------------------------
     # Reflection-pad so (H_pad - tile_size) is divisible by stride,
@@ -251,94 +283,98 @@ def tiled_sr(model: torch.nn.Module,
     total_w = pad_w + wpad_w
 
     if total_h > 0 or total_w > 0:
-        # Reflection padding requires pad < image dim; fall back to replicate
         pad_mode = 'reflect' if total_h < H and total_w < W else 'replicate'
         lq_pad = F.pad(lq, (0, total_w, 0, total_h), mode=pad_mode)
         # lq_pad: (1, C, H+total_h, W+total_w)  float32
     else:
         lq_pad = lq
-        # lq_pad: (1, C, H, W)  float32  -- no padding needed
+        # lq_pad: (1, C, H, W)  float32
 
     _, _, H_pad, W_pad = lq_pad.shape
 
     # ---- 2. Compute tile start positions (LR space) --------------------------
-    ys = _tile_starts(H_pad, tile_size, stride)   # row starts, len = n_rows
-    xs = _tile_starts(W_pad, tile_size, stride)   # col starts, len = n_cols
-    n_rows, n_cols = len(ys), len(xs)
-    n_total = n_rows * n_cols   # total number of tiles
+    ys = _tile_starts(H_pad, tile_size, stride)   # len = n_rows
+    xs = _tile_starts(W_pad, tile_size, stride)   # len = n_cols
+    n_total = len(ys) * len(xs)
 
     # ---- 3. Collect all LR tile views into a flat list -----------------------
-    # tile_meta: flat list of (row_idx, col_idx, y_start, x_start) -- N_total entries
-    # tile_views: list of (C, tile_size, tile_size) tensors (zero-copy views of lq_pad)
+    # tile_views: list of (C, tile_size, tile_size) zero-copy views of lq_pad
+    # tile_meta:  parallel list of (yr, xr) LR start coordinates
     tile_meta  = []
     tile_views = []
-    for i, yr in enumerate(ys):
-        for j, xr in enumerate(xs):
-            tile_meta.append((i, j, yr, xr))
-            # Slice out (C, tile_size, tile_size) -- view, no data copy
+    for yr in ys:
+        for xr in xs:
+            tile_meta.append((yr, xr))
             tile_views.append(lq_pad[0, :, yr:yr + tile_size, xr:xr + tile_size])
+            # Each view: (C, tile_size, tile_size)  float32
 
-    # ---- 4. Allocate FP32 HR output canvas -----------------------------------
-    out_H = H_pad * upscale
-    out_W = W_pad * upscale
-    output = lq.new_zeros(1, C, out_H, out_W)
-    # output: (1, C, H_pad*upscale, W_pad*upscale)  float32
+    # ---- 4. Allocate FP32 HR accumulation canvases ---------------------------
+    hr_tile = tile_size * upscale          # HR tile side length
+    out_H   = H_pad * upscale
+    out_W   = W_pad * upscale
 
-    # BF16 autocast on CUDA → full H100 Tensor Core utilisation
-    # CPU path: standard FP32 (autocast not applied)
+    output_canvas = lq.new_zeros(1, C, out_H, out_W)
+    # output_canvas: (1, C, H_pad*upscale, W_pad*upscale)  float32
+
+    weight_canvas = lq.new_zeros(1, 1, out_H, out_W)
+    # weight_canvas: (1, 1, H_pad*upscale, W_pad*upscale)  float32
+
+    # Pre-compute 2-D blend mask (same shape for every tile)
+    # blend: (hr_tile, hr_tile) float32
+    # blend[i,j] ramps from 1/(fade+1) at edges to 1.0 in the centre
+    blend = _make_blend_weights(hr_tile, tile_overlap * upscale, device)
+    # Expand for broadcasting with (B, C, hr_tile, hr_tile)
+    blend_bc = blend.unsqueeze(0).unsqueeze(0)   # (1, 1, hr_tile, hr_tile)
+
+    # BF16 autocast on CUDA → H100 Tensor Core utilisation
     use_bf16 = (device.type == 'cuda')
 
-    # ---- 5. Forward in mini-batches, paste each HR tile ----------------------
+    # ---- 5. Forward in mini-batches, accumulate with blend mask --------------
     for batch_start in range(0, n_total, tile_batch_size):
         batch_end = min(batch_start + tile_batch_size, n_total)
 
         # --- 5a. Stack LR tiles into a mini-batch ----------------------------
-        # Input to model: (B, C, tile_size, tile_size)  float32
+        # lr_batch: (B, C, tile_size, tile_size)  float32
         #   B = batch_end - batch_start  (≤ tile_batch_size)
         lr_batch = torch.stack(tile_views[batch_start:batch_end])
-        # lr_batch: (B, C, tile_size, tile_size)  float32
 
-        # --- 5b. Forward through model ----------------------------------------
+        # --- 5b. Forward: BF16 on CUDA, FP32 on CPU --------------------------
         if use_bf16:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 hr_batch = model(lr_batch)
-                # hr_batch: (B, C, tile_size*upscale, tile_size*upscale)  bfloat16
-            # Cast back to FP32 before writing to the FP32 output canvas
+                # hr_batch: (B, C, hr_tile, hr_tile)  bfloat16
             hr_batch = hr_batch.float()
-            # hr_batch: (B, C, tile_size*upscale, tile_size*upscale)  float32
+            # hr_batch: (B, C, hr_tile, hr_tile)  float32
         else:
             hr_batch = model(lr_batch)
-            # hr_batch: (B, C, tile_size*upscale, tile_size*upscale)  float32
+            # hr_batch: (B, C, hr_tile, hr_tile)  float32
 
-        # --- 5c. Crop borders and paste each HR tile into the canvas ----------
-        for k, (i, j, yr, xr) in enumerate(tile_meta[batch_start:batch_end]):
-            # tile_hr: (C, tile_size*upscale, tile_size*upscale)  float32
+        # --- 5c. Weighted accumulation into canvases -------------------------
+        for k, (yr, xr) in enumerate(tile_meta[batch_start:batch_end]):
+            # tile_hr: (C, hr_tile, hr_tile)  float32  — single tile from batch
             tile_hr = hr_batch[k]
-            th, tw = tile_hr.shape[1], tile_hr.shape[2]
 
-            # Border crop: skip outer edge for first / last tile in each axis
-            crop_top    = c if i > 0 else 0
-            crop_left   = c if j > 0 else 0
-            crop_bottom = c if i < n_rows - 1 else 0
-            crop_right  = c if j < n_cols - 1 else 0
+            y_hr = yr * upscale
+            x_hr = xr * upscale
 
-            bot_idx = th - crop_bottom if crop_bottom else th
-            rgt_idx = tw - crop_right  if crop_right  else tw
+            # Accumulate: output_canvas += tile_hr * blend_mask
+            # (C, hr_tile, hr_tile) * (1, hr_tile, hr_tile) -> broadcasts over C
+            output_canvas[0, :, y_hr:y_hr + hr_tile, x_hr:x_hr + hr_tile] += (
+                tile_hr * blend
+            )
 
-            # safe: (C, sh, sw)  -- central, artifact-free HR region
-            safe = tile_hr[:, crop_top:bot_idx, crop_left:rgt_idx]
+            # Accumulate blend weights (same for every channel)
+            weight_canvas[0, 0, y_hr:y_hr + hr_tile, x_hr:x_hr + hr_tile] += blend
 
-            paste_y = yr * upscale + crop_top
-            paste_x = xr * upscale + crop_left
-            sh, sw = safe.shape[1], safe.shape[2]
+    # ---- 6. Normalize: divide pixel sums by accumulated weight sums ----------
+    # Clamp prevents division-by-zero (all weights are > 0 by construction,
+    # but the clamp adds safety for any uncovered padded region).
+    # output_final: (1, C, H_pad*upscale, W_pad*upscale)  float32
+    output_final = output_canvas / weight_canvas.clamp(min=1e-8)
 
-            # Paste into FP32 canvas
-            # output[0]: (C, out_H, out_W), safe region written at [paste_y, paste_x]
-            output[0, :, paste_y:paste_y + sh, paste_x:paste_x + sw] = safe
-
-    # ---- 6. Crop padding back to original HR resolution ----------------------
-    # output: (1, C, H_pad*upscale, W_pad*upscale) -> (1, C, H*upscale, W*upscale)
-    return output[:, :, :H * upscale, :W * upscale]
+    # ---- 7. Crop padding back to original HR resolution ----------------------
+    # (1, C, H_pad*upscale, W_pad*upscale) -> (1, C, H*upscale, W*upscale)
+    return output_final[:, :, :H * upscale, :W * upscale]
 
 
 # ---------------------------------------------------------------------------
