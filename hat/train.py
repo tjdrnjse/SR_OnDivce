@@ -22,7 +22,7 @@ import os.path as osp
 import time
 
 import torch
-from torch.utils.data import ConcatDataset
+from torch.utils.data import ConcatDataset, DataLoader
 
 import hat.archs
 import hat.data
@@ -37,6 +37,10 @@ from basicsr.utils import (AvgTimer, MessageLogger, check_resume,
                             init_tb_logger, init_wandb_logger,
                             make_exp_dirs, mkdir_and_rename, scandir)
 from basicsr.utils.options import copy_opt_file, dict2str, parse_options
+
+from hat.data.joint_batch_sampler import (
+    JointBatchSampler, StreamTaggedDataset, joint_collate_fn
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -65,15 +69,25 @@ def _init_tb_loggers(opt):
 def _create_train_val_dataloader(opt, logger):
     """Build train and validation DataLoaders from the YAML datasets section.
 
-    Supports any number of training datasets:
+    Standard mode (default):
       train / train_1 / train_2 / train_3 / ...
-    All are concatenated via ``torch.utils.data.ConcatDataset``.
-    DataLoader hyper-parameters (batch_size, num_workers, prefetch_mode …)
-    are taken from the **first** train dataset entry in YAML order.
+      All are concatenated via ``torch.utils.data.ConcatDataset`` and a
+      single ``EnlargedSampler`` is used (random shuffle, no stream guarantee).
+
+    Joint-Batch mode (activated by ``joint_batch_training: true`` in YAML):
+      Exactly two train datasets must be declared (train_1 = Stream A,
+      train_2 = Stream B).  A ``JointBatchSampler`` guarantees that every
+      mini-batch contains exactly ``batch_size // 2`` samples from each stream.
+      Each dataset is tagged with its stream_id (0 or 1) via
+      ``StreamTaggedDataset`` so that ``KDSRModel.feed_data`` can identify
+      which samples need on-the-fly degradation synthesis.
 
     Validation datasets:
       val / val_1 / val_2 / ...
-    Each becomes a separate DataLoader (standard basicsr behaviour).
+      Each becomes a separate DataLoader (standard basicsr behaviour).
+
+    DataLoader hyper-parameters (batch_size, num_workers, prefetch_mode …)
+    are always taken from the **first** train dataset entry in YAML order.
     """
     train_sets = []
     train_opts = []   # dataset-level configs for each train split
@@ -111,7 +125,71 @@ def _create_train_val_dataloader(opt, logger):
     if not train_sets:
         raise ValueError('No training dataset found in the YAML config.')
 
-    # ---- Concatenate all train datasets ------------------------------------
+    # ---- Loader hyper-params always come from the first train entry --------
+    loader_opt = train_opts[0]
+    dataset_enlarge_ratio = loader_opt.get('dataset_enlarge_ratio', 1)
+    batch_size_per_gpu = loader_opt['batch_size_per_gpu']
+    total_iters = int(opt['train']['total_iter'])
+
+    # ============================================================
+    # Joint-Batch mode: guaranteed 50/50 A/B split per mini-batch
+    # ============================================================
+    if opt.get('joint_batch_training', False):
+        if len(train_sets) != 2:
+            raise ValueError(
+                '`joint_batch_training: true` requires exactly 2 train '
+                f'datasets (train_1 and train_2), but got {len(train_sets)}.')
+
+        dataset_a = StreamTaggedDataset(train_sets[0], stream_id=0)
+        dataset_b = StreamTaggedDataset(train_sets[1], stream_id=1)
+        train_set = ConcatDataset([dataset_a, dataset_b])
+        n_a, n_b = len(dataset_a), len(dataset_b)
+
+        # Epoch = one full pass over the *larger* dataset; each batch draws
+        # batch_size//2 from each stream → use n_a_per_batch to calculate.
+        n_a_per_gpu = batch_size_per_gpu // 2
+        num_iter_per_epoch = math.ceil(
+            max(n_a, n_b) * dataset_enlarge_ratio
+            / (n_a_per_gpu * opt['world_size'])
+        )
+        total_epochs = math.ceil(total_iters / num_iter_per_epoch)
+
+        train_sampler = JointBatchSampler(
+            n_a=n_a,
+            n_b=n_b,
+            batch_size=batch_size_per_gpu,
+            iters_per_epoch=num_iter_per_epoch,
+            seed=opt.get('manual_seed', 0),
+            rank=opt['rank'],
+            world_size=opt['world_size'],
+        )
+
+        num_workers = loader_opt.get('num_worker_per_gpu', 4) * opt['num_gpu']
+        train_loader = DataLoader(
+            train_set,
+            batch_sampler=train_sampler,
+            num_workers=num_workers,
+            collate_fn=joint_collate_fn,
+            pin_memory=loader_opt.get('pin_memory', False),
+            persistent_workers=(num_workers > 0),
+        )
+
+        logger.info(
+            'Joint-Batch training statistics:'
+            f'\n\tStream A [{train_opts[0]["name"]}] : {n_a} images'
+            f'\n\tStream B [{train_opts[1]["name"]}] : {n_b} images'
+            f'\n\tA per batch / gpu   : {n_a_per_gpu}'
+            f'\n\tB per batch / gpu   : {batch_size_per_gpu - n_a_per_gpu}'
+            f'\n\tBatch size / gpu    : {batch_size_per_gpu}'
+            f'\n\tWorld size (# gpus) : {opt["world_size"]}'
+            f'\n\tIters / epoch       : {num_iter_per_epoch}'
+            f'\n\tTotal epochs        : {total_epochs}; iters: {total_iters}.')
+
+        return train_loader, train_sampler, val_loaders, total_epochs, total_iters
+
+    # ============================================================
+    # Standard mode: ConcatDataset + EnlargedSampler (existing behaviour)
+    # ============================================================
     if len(train_sets) == 1:
         train_set = train_sets[0]
     else:
@@ -120,11 +198,6 @@ def _create_train_val_dataloader(opt, logger):
         logger.info(
             f'Concatenated {len(train_sets)} train datasets '
             f'(sizes: {sizes}) -> {len(train_set)} total images.')
-
-    # ---- Build single DataLoader from the combined dataset -----------------
-    # Loader hyper-params come from the first train entry.
-    loader_opt = train_opts[0]
-    dataset_enlarge_ratio = loader_opt.get('dataset_enlarge_ratio', 1)
 
     train_sampler = EnlargedSampler(
         train_set, opt['world_size'], opt['rank'], dataset_enlarge_ratio)
@@ -137,8 +210,7 @@ def _create_train_val_dataloader(opt, logger):
 
     num_iter_per_epoch = math.ceil(
         len(train_set) * dataset_enlarge_ratio
-        / (loader_opt['batch_size_per_gpu'] * opt['world_size']))
-    total_iters = int(opt['train']['total_iter'])
+        / (batch_size_per_gpu * opt['world_size']))
     total_epochs = math.ceil(total_iters / num_iter_per_epoch)
 
     logger.info(
@@ -146,7 +218,7 @@ def _create_train_val_dataloader(opt, logger):
         f'\n\tTrain datasets      : {len(train_sets)}'
         f'\n\tTotal train images  : {len(train_set)}'
         f'\n\tEnlarge ratio       : {dataset_enlarge_ratio}'
-        f'\n\tBatch size / gpu    : {loader_opt["batch_size_per_gpu"]}'
+        f'\n\tBatch size / gpu    : {batch_size_per_gpu}'
         f'\n\tWorld size (# gpus) : {opt["world_size"]}'
         f'\n\tIters / epoch       : {num_iter_per_epoch}'
         f'\n\tTotal epochs        : {total_epochs}; iters: {total_iters}.')

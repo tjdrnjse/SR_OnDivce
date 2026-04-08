@@ -3,18 +3,24 @@ Knowledge Distillation Super-Resolution Model (KDSRModel).
 
 Implements FitNet-style KD pipeline:
   - Teacher (HAT or MambaIRv2): frozen, eval-mode, on-the-fly Pseudo-GT
-  - Student (RepSR): trained with Feature-level KD + Output-level KD
+  - Student (RepSR / HAT-S): trained with Feature-level KD + Output-level KD
+
+Supports **Joint-Batch training** with two data streams:
+  - Stream A (RealESRGANDataset): HR images + kernels → LR synthesized on GPU
+    via a two-stage degradation pipeline (blur → resize → noise → JPEG).
+  - Stream B (SingleLRDataset): real LR images, no degradation applied.
 
 References:
   - FitNets: https://arxiv.org/abs/1412.6550
   - RepDistiller: https://github.com/HobbitLong/RepDistiller
+  - Real-ESRGAN: https://arxiv.org/abs/2107.10833
 
 YAML keys consumed by this model (under `train:`):
   kd_feat_opt:
     loss_weight: 1.0     # weight for feature-level MSE loss
   kd_output_opt:
     loss_weight: 1.0     # weight for output-level L1 loss
-  pixel_opt:             # optional supervised loss against ground-truth HR
+  pixel_opt:             # optional supervised loss for Stream A vs real GT
     loss_weight: 1.0
 
   teacher_feat_channels: 64   # channels at teacher's conv_before_upsample output
@@ -24,9 +30,27 @@ YAML keys for tiling (under root level):
   tile:
     patch_size: 256    # LR tile spatial size
     overlap_size: 32   # LR overlap between adjacent tiles
+
+YAML keys for Joint-Batch degradation pipeline (under `degradation:`):
+  gt_size: 256                # HR patch size for Stream A (LQ = gt_size // teacher_upscale)
+  resize_prob: [0.2, 0.7, 0.1]
+  resize_range: [0.15, 1.5]
+  gaussian_noise_prob: 0.5
+  noise_range: [1, 30]
+  poisson_scale_range: [0.05, 3.0]
+  gray_noise_prob: 0.4
+  jpeg_range: [30, 95]
+  # -- second degradation --
+  second_blur_prob: 0.8
+  gaussian_noise_prob2: 0.5
+  noise_range2: [1, 25]
+  poisson_scale_range2: [0.05, 2.5]
+  gray_noise_prob2: 0.4
+  jpeg_range2: [30, 95]
 """
 
 import math
+import random
 from copy import deepcopy
 import torch
 import torch.nn as nn
@@ -244,6 +268,14 @@ class KDSRModel(SRModel):
         ).get('loss_weight', 1.0)
 
         # ------------------------------------------------------------------ #
+        # GPU-side degradation pipeline (Stream A: RealESRGAN-style)          #
+        # Only built when `degradation:` section is present in YAML.          #
+        # ------------------------------------------------------------------ #
+        self._has_degradation = 'degradation' in opt
+        if self._has_degradation and self.is_train:
+            self._build_degradation_pipeline()
+
+        # ------------------------------------------------------------------ #
         # Optimizer + scheduler (deferred from init_training_settings so that  #
         # feat_projector is available when setup_optimizers runs)              #
         # ------------------------------------------------------------------ #
@@ -255,7 +287,8 @@ class KDSRModel(SRModel):
             f'KDSRModel | teacher: {teacher_opt["type"]} | '
             f'student: {opt["network_g"]["type"]} | '
             f'feat_weight={self.kd_feat_weight} | '
-            f'output_weight={self.kd_output_weight}'
+            f'output_weight={self.kd_output_weight} | '
+            f'degradation_pipeline={self._has_degradation}'
         )
 
     # ---------------------------------------------------------------------- #
@@ -310,22 +343,218 @@ class KDSRModel(SRModel):
         # has been created.
 
     # ---------------------------------------------------------------------- #
+    # GPU-side degradation pipeline (Stream A)                                #
+    # ---------------------------------------------------------------------- #
+
+    def _build_degradation_pipeline(self):
+        """Initialise DiffJPEG and USM-sharpener for Stream A LQ synthesis."""
+        from basicsr.data.degradations import DiffJPEG, USMSharp
+        self.jpeger = DiffJPEG(differentiable=False).to(self.device)
+        self.usm_sharpener = USMSharp().to(self.device)
+        logger = get_root_logger()
+        logger.info('KDSRModel: two-stage degradation pipeline ready (Stream A)')
+
+    @torch.no_grad()
+    def _degrade_gt_to_lq(self, gt, kernel1, kernel2, sinc_kernel):
+        """Synthesize LQ from HR GT using the two-stage degradation pipeline.
+
+        Mirrors Real-ESRGAN's GPU-side feed_data processing.
+        All randomness parameters are read from ``opt['degradation']``.
+
+        Args:
+            gt         (B, C, H_gt, W_gt): HR ground-truth patches (float32).
+            kernel1    (B, 21, 21)        : First-stage blur kernels.
+            kernel2    (B, 21, 21)        : Second-stage blur kernels.
+            sinc_kernel(B, 21, 21)        : Final sinc filter kernel.
+
+        Returns:
+            lq    (B, C, lq_size, lq_size): Synthesized LQ patches.
+            gt_usm(B, C, gt_size, gt_size): USM-sharpened GT for supervision.
+        """
+        from basicsr.utils.img_process_util import filter2D
+        from basicsr.data.degradations import (
+            random_add_gaussian_noise_pt,
+            random_add_poisson_noise_pt,
+        )
+
+        dopt = self.opt['degradation']
+        gt_size = dopt.get('gt_size', 256)
+        teacher_up = self.opt['network_teacher']['upscale']
+        lq_size = gt_size // teacher_up
+
+        # --- Crop GT batch to gt_size (same spatial crop for all items) ----
+        _, _, h, w = gt.shape
+        if h > gt_size:
+            top = random.randint(0, h - gt_size)
+            gt = gt[:, :, top:top + gt_size, :]
+        if w > gt_size:
+            left = random.randint(0, w - gt_size)
+            gt = gt[:, :, :, left:left + gt_size]
+
+        # --- USM sharpening -------------------------------------------------
+        gt_usm = self.usm_sharpener(gt)
+
+        # ===== First degradation pass =======================================
+        out = filter2D(gt_usm, kernel1)
+
+        # Random resize
+        updown = random.choices(
+            ['up', 'down', 'keep'],
+            weights=dopt.get('resize_prob', [1 / 3, 1 / 3, 1 / 3])
+        )[0]
+        rr = dopt.get('resize_range', [0.15, 1.5])
+        scale1 = (
+            random.uniform(1.0, rr[1]) if updown == 'up' else
+            random.uniform(rr[0], 1.0) if updown == 'down' else 1.0
+        )
+        mode1 = random.choice(['area', 'bilinear', 'bicubic'])
+        interp_kw = {} if mode1 == 'area' else {'align_corners': False}
+        out = F.interpolate(out, scale_factor=scale1, mode=mode1, **interp_kw)
+
+        # Noise 1
+        if random.random() < dopt.get('gaussian_noise_prob', 0.5):
+            out = random_add_gaussian_noise_pt(
+                out,
+                sigma_range=dopt.get('noise_range', [1, 30]),
+                clip=True, rounds=False,
+                gray_prob=dopt.get('gray_noise_prob', 0.4))
+        else:
+            out = random_add_poisson_noise_pt(
+                out,
+                scale_range=dopt.get('poisson_scale_range', [0.05, 3.0]),
+                gray_prob=dopt.get('gray_noise_prob', 0.4),
+                clip=True, rounds=False)
+
+        # JPEG 1
+        jpeg_p1 = out.new_zeros(out.size(0)).uniform_(*dopt.get('jpeg_range', [30, 95]))
+        out = self.jpeger(out.clamp(0, 1), quality=jpeg_p1)
+
+        # ===== Second degradation pass ======================================
+        # Resize to target LQ resolution
+        mode2 = random.choice(['area', 'bilinear', 'bicubic'])
+        interp_kw2 = {} if mode2 == 'area' else {'align_corners': False}
+        out = F.interpolate(out, size=(lq_size, lq_size), mode=mode2, **interp_kw2)
+
+        out = filter2D(out, kernel2)
+
+        # Noise 2
+        if random.random() < dopt.get('gaussian_noise_prob2', 0.5):
+            out = random_add_gaussian_noise_pt(
+                out,
+                sigma_range=dopt.get('noise_range2', [1, 25]),
+                clip=True, rounds=False,
+                gray_prob=dopt.get('gray_noise_prob2', 0.4))
+        else:
+            out = random_add_poisson_noise_pt(
+                out,
+                scale_range=dopt.get('poisson_scale_range2', [0.05, 2.5]),
+                gray_prob=dopt.get('gray_noise_prob2', 0.4),
+                clip=True, rounds=False)
+
+        # Final sinc (applied with probability second_blur_prob)
+        if random.random() < dopt.get('second_blur_prob', 0.8):
+            out = filter2D(out, sinc_kernel)
+
+        # JPEG 2
+        jpeg_p2 = out.new_zeros(out.size(0)).uniform_(*dopt.get('jpeg_range2', [30, 95]))
+        lq = self.jpeger(out.clamp(0, 1), quality=jpeg_p2).clamp(0, 1)
+
+        return lq, gt_usm
+
+    # ---------------------------------------------------------------------- #
     # Data feeding                                                             #
     # ---------------------------------------------------------------------- #
 
     def feed_data(self, data):
         """Feed a batch to the model.
 
-        Accepts data dicts both with and without a ``'gt'`` key so that
-        ``SingleLRDataset`` (LR-only) and paired datasets can both be used.
-        Stale ``self.gt`` from a previous iteration is cleared when the
-        current batch has no GT, preventing cross-iteration leakage.
+        Handles three input formats:
+
+        1. **Standard paired batch** (``PairedImageDataset``):
+           ``data`` has ``'lq'`` and ``'gt'`` as stacked tensors.
+
+        2. **LR-only batch** (``SingleLRDataset``):
+           ``data`` has ``'lq'`` but no ``'gt'``.
+
+        3. **Joint Batch** (``joint_batch_training: true``):
+           ``data`` produced by ``joint_collate_fn`` — keys may be stacked
+           tensors (homogeneous) or plain lists with ``None`` slots
+           (heterogeneous).  ``stream_id`` encodes which samples belong to
+           Stream A (0, RealESRGAN) and Stream B (1, SingleLR).
+
+           For Stream A samples the GT + kernels are extracted and LQ is
+           synthesized on-the-fly via ``_degrade_gt_to_lq``.  For Stream B
+           the pre-loaded ``lq`` tensor is used directly.  The final
+           ``self.lq`` is the concatenation ``[lq_A | lq_B]`` along the
+           batch dimension.  ``self.n_stream_a`` records how many Stream A
+           samples are in the batch so ``optimize_parameters`` can split them.
         """
-        self.lq = data['lq'].to(self.device)
-        if 'gt' in data:
-            self.gt = data['gt'].to(self.device)
-        elif hasattr(self, 'gt'):
-            del self.gt   # clear stale GT from any previous paired batch
+        # ---- Detect mode ---------------------------------------------------
+        is_joint = isinstance(data.get('stream_id'), torch.Tensor)
+
+        if not is_joint:
+            # ---- Standard path (unchanged behaviour) -----------------------
+            self.lq = data['lq'].to(self.device)
+            if 'gt' in data:
+                self.gt = data['gt'].to(self.device)
+            elif hasattr(self, 'gt'):
+                del self.gt
+            self.n_stream_a = 0   # no per-stream split needed
+            return
+
+        # ---- Joint-Batch path ----------------------------------------------
+        stream_ids = data['stream_id']          # LongTensor (B,)
+        mask_a = (stream_ids == 0)              # boolean mask for Stream A
+        mask_b = (stream_ids == 1)              # boolean mask for Stream B
+        n_a = int(mask_a.sum().item())
+        n_b = int(mask_b.sum().item())
+        self.n_stream_a = n_a
+
+        # Helper: extract items at boolean mask positions from a possibly-list value
+        def _extract(key, mask):
+            val = data.get(key)
+            if val is None:
+                return None
+            if isinstance(val, torch.Tensor):
+                return val[mask]
+            # list with potential None entries
+            indices = mask.nonzero(as_tuple=True)[0].tolist()
+            items = [val[i] for i in indices if val[i] is not None]
+            return torch.stack(items) if items else None
+
+        # ---- Stream B: real LR — used directly -----------------------------
+        lq_b = None
+        if n_b > 0:
+            lq_b = _extract('lq', mask_b).to(self.device)
+
+        # ---- Stream A: synthesize LQ from HR + kernels ---------------------
+        lq_a = None
+        gt_usm_a = None
+        if n_a > 0:
+            if not self._has_degradation:
+                raise RuntimeError(
+                    'Joint-Batch Stream A (RealESRGANDataset) requires a '
+                    '`degradation:` section in the YAML config.'
+                )
+            gt_a = _extract('gt', mask_a).to(self.device)
+            k1_a = _extract('kernel1', mask_a).to(self.device)
+            k2_a = _extract('kernel2', mask_a).to(self.device)
+            sinc_a = _extract('sinc_kernel', mask_a).to(self.device)
+            lq_a, gt_usm_a = self._degrade_gt_to_lq(gt_a, k1_a, k2_a, sinc_a)
+
+        # ---- Concatenate [A | B] into self.lq ------------------------------
+        parts = [p for p in (lq_a, lq_b) if p is not None]
+        self.lq = torch.cat(parts, dim=0)
+
+        # Store USM-sharpened GT for Stream A pixel loss (optional)
+        if gt_usm_a is not None:
+            self.gt_a = gt_usm_a
+        elif hasattr(self, 'gt_a'):
+            del self.gt_a
+
+        # Clear stale unpaired gt
+        if hasattr(self, 'gt'):
+            del self.gt
 
     # ---------------------------------------------------------------------- #
     # Hook registration                                                        #
@@ -551,12 +780,29 @@ class KDSRModel(SRModel):
         # ---- Output-level KD loss (L1 vs teacher pseudo-GT) ----------------
         l_kd_out = F.l1_loss(student_out, pseudo_gt) * self.kd_output_weight
 
-        # ---- Optional supervised pixel loss (vs real HR GT) ----------------
+        # ---- Optional supervised pixel loss --------------------------------
+        # Case 1: standard paired batch → self.gt covers the whole batch.
+        # Case 2: joint batch → self.gt_a covers only Stream A samples
+        #         (first self.n_stream_a items in student_out / pseudo_gt).
         l_total = l_kd_feat + l_kd_out
         l_pix = torch.zeros_like(l_total)
-        if self.cri_pix is not None and hasattr(self, 'gt'):
-            l_pix = self.cri_pix(student_out, self.gt)
-            l_total = l_total + l_pix
+        if self.cri_pix is not None:
+            if hasattr(self, 'gt'):
+                # Standard paired or KD with explicit GT for all samples
+                l_pix = self.cri_pix(student_out, self.gt)
+                l_total = l_total + l_pix
+            elif hasattr(self, 'gt_a') and self.n_stream_a > 0:
+                # Joint batch: pixel loss only on Stream A slice
+                student_out_a = student_out[:self.n_stream_a]
+                gt_a = self.gt_a
+                # Resize GT to match student output if spatial sizes differ
+                # (happens in cross-scale KD: teacher_up != student_up)
+                if gt_a.shape[2:] != student_out_a.shape[2:]:
+                    gt_a = F.interpolate(
+                        gt_a, size=student_out_a.shape[2:],
+                        mode='bicubic', antialias=True, align_corners=False)
+                l_pix = self.cri_pix(student_out_a, gt_a)
+                l_total = l_total + l_pix
 
         l_total.backward()
         self.optimizer_g.step()

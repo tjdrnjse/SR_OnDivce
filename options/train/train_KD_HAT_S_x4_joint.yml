@@ -1,0 +1,252 @@
+# ============================================================
+# Joint-Batch Knowledge Distillation SR Training
+#
+#   Teacher : HAT-L  (x4, Real_HAT_GAN_SRx4, frozen)
+#   Student : HAT-S  (x4, trained from scratch or warm-started)
+#   Scale   : x4
+#
+# Stream A  : RealESRGANDataset — HR crops, LQ synthesized on GPU
+#             Purpose: general quality restoration + teacher imitation
+# Stream B  : SingleLRDataset  — real generative-model LR images
+#             Purpose: VAE artifact removal via KD (no degradation applied)
+#
+# Joint-Batch guarantee: exactly batch_size//2 samples per stream
+# per mini-batch, enforced by JointBatchSampler.
+# ============================================================
+
+name: train_KD_HAT_S_x4_joint
+model_type: KDSRModel
+scale: 4          # student target scale
+num_gpu: auto
+manual_seed: 0
+
+# ============================================================
+# Enable Joint-Batch mode: guaranteed 50/50 A/B split
+# Requires exactly train_1 (Stream A) + train_2 (Stream B).
+# ============================================================
+joint_batch_training: true
+
+# ============================================================
+# Dataset settings
+# ============================================================
+datasets:
+  # ── Stream A: RealESRGAN-style degradation ─────────────────
+  train_1:
+    name: HR_degradation
+    type: RealESRGANDataset
+    dataroot_gt: /path/to/hr_images     # <-- replace with real HR folder
+    io_backend:
+      type: disk
+
+    use_hflip: true
+    use_rot: true
+
+    # Blur kernel settings (used by RealESRGANDataset on CPU)
+    blur_kernel_size: 21
+    kernel_list: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso',
+                  'plateau_iso', 'plateau_aniso']
+    kernel_prob: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+    sinc_prob: 0.1
+    blur_sigma: [0.2, 3.0]
+    betag_range: [0.5, 4.0]
+    betap_range: [1.0, 2.0]
+
+    blur_kernel_size2: 21
+    kernel_list2: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso',
+                   'plateau_iso', 'plateau_aniso']
+    kernel_prob2: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+    sinc_prob2: 0.1
+    blur_sigma2: [0.2, 1.5]
+    betag_range2: [0.5, 4.0]
+    betap_range2: [1.0, 2.0]
+    final_sinc_prob: 0.8
+
+    # DataLoader settings (applies to the combined loader as well)
+    num_worker_per_gpu: 4
+    batch_size_per_gpu: 16   # total per GPU: 8 from A + 8 from B
+    dataset_enlarge_ratio: 1
+    prefetch_mode: ~
+
+  # ── Stream B: real LR images, no degradation ───────────────
+  train_2:
+    name: LR_generative
+    type: SingleLRDataset
+    dataroot_lq: /path/to/generative_lr_images   # <-- replace with real LR folder
+    io_backend:
+      type: disk
+
+    # lq_patch_size MUST equal degradation.gt_size // teacher_upscale
+    # = 256 // 4 = 64
+    lq_patch_size: 64
+    use_hflip: true
+    use_rot: true
+
+  # ── Validation datasets ─────────────────────────────────────
+  val_1:
+    name: Set5
+    type: PairedImageDataset
+    dataroot_gt: ./datasets/Set5/GTmod4
+    dataroot_lq: ./datasets/Set5/LRbicx4
+    io_backend:
+      type: disk
+
+  val_2:
+    name: Set14
+    type: PairedImageDataset
+    dataroot_gt: ./datasets/Set14/GTmod4
+    dataroot_lq: ./datasets/Set14/LRbicx4
+    io_backend:
+      type: disk
+
+# ============================================================
+# GPU-side degradation pipeline (Stream A only)
+# These parameters are ONLY read by KDSRModel._degrade_gt_to_lq.
+# They have NO effect on Stream B (SingleLRDataset).
+# ============================================================
+degradation:
+  gt_size: 256            # HR patch size → LQ size = 256 // 4 = 64
+
+  # ── First degradation pass ───────────────────────────────────
+  resize_prob: [0.2, 0.7, 0.1]     # up / down / keep
+  resize_range: [0.15, 1.5]
+  gaussian_noise_prob: 0.5
+  noise_range: [1, 30]
+  poisson_scale_range: [0.05, 3.0]
+  gray_noise_prob: 0.4
+  jpeg_range: [30, 95]
+
+  # ── Second degradation pass ──────────────────────────────────
+  second_blur_prob: 0.8
+  gaussian_noise_prob2: 0.5
+  noise_range2: [1, 25]
+  poisson_scale_range2: [0.05, 2.5]
+  gray_noise_prob2: 0.4
+  jpeg_range2: [30, 95]
+
+# ============================================================
+# Student network: HAT-Small x4 (6-stage, embed_dim=144)
+# ============================================================
+network_g:
+  type: HAT
+  upscale: 4
+  in_chans: 3
+  img_size: 64
+  window_size: 16
+  compress_ratio: 24
+  squeeze_factor: 24
+  conv_scale: 0.01
+  overlap_ratio: 0.5
+  img_range: 1.
+  depths: [6, 6, 6, 6, 6, 6]
+  embed_dim: 144
+  num_heads: [6, 6, 6, 6, 6, 6]
+  mlp_ratio: 2
+  upsampler: 'pixelshuffle'
+  resi_connection: '1conv'
+
+# ============================================================
+# Teacher network: HAT-Large x4 (Real_HAT_GAN_SRx4)
+# Frozen throughout training.
+# ============================================================
+network_teacher:
+  type: HAT
+  upscale: 4
+  in_chans: 3
+  img_size: 64
+  window_size: 16
+  compress_ratio: 3
+  squeeze_factor: 30
+  conv_scale: 0.01
+  overlap_ratio: 0.5
+  img_range: 1.
+  depths: [6, 6, 6, 6, 6, 6]
+  embed_dim: 180
+  num_heads: [6, 6, 6, 6, 6, 6]
+  mlp_ratio: 2
+  upsampler: 'pixelshuffle'
+  resi_connection: '1conv'
+
+# ============================================================
+# Path settings
+# ============================================================
+path:
+  pretrain_network_g: ~           # warm-start from HAT-S pretrain (optional)
+  strict_load_g: false
+  resume_state: ~
+  pretrain_network_teacher: /path/to/Real_HAT_GAN_SRx4.pth  # REQUIRED
+
+# ============================================================
+# Training settings
+# ============================================================
+train:
+  ema_decay: 0.999
+
+  optim_g:
+    type: Adam
+    lr: !!float 2e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: MultiStepLR
+    milestones: [200000, 300000, 350000, 375000]
+    gamma: 0.5
+
+  total_iter: 400000
+  warmup_iter: -1
+
+  # ── Optional supervised pixel loss (Stream A only, vs USM-sharpened GT) ──
+  # Disable by removing this block.
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 0.5
+    reduction: mean
+
+  # ── Feature-level KD (FitNet MSE) — applied to all samples ───────────────
+  kd_feat_opt:
+    loss_weight: 0.1
+
+  # ── Output-level KD (L1 vs teacher pseudo-GT) — applied to all samples ───
+  kd_output_opt:
+    loss_weight: 1.0
+
+  # ── Feature channel dims ──────────────────────────────────────────────────
+  student_feat_channels: 64   # HAT conv_before_upsample always outputs 64ch
+  teacher_feat_channels: 64
+
+# ============================================================
+# Validation settings
+# ============================================================
+val:
+  val_freq: !!float 5e3
+  save_img: true
+  save_img_num: 4
+  pbar: false
+
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 4
+      test_y_channel: true
+      better: higher
+    ssim:
+      type: calculate_ssim
+      crop_border: 4
+      test_y_channel: true
+      better: higher
+
+# ============================================================
+# Logging settings
+# ============================================================
+logger:
+  print_freq: 100
+  save_checkpoint_freq: !!float 5e3
+  use_tb_logger: true
+  tb_train_vis_freq: 500
+  wandb:
+    project: ~
+    resume_id: ~
+
+dist_params:
+  backend: nccl
+  port: 29500

@@ -15,10 +15,11 @@ A **turn-key Knowledge Distillation (KD) Super-Resolution** framework built on t
 2. [Dataset & Directory Layout](#2-dataset--directory-layout)
 3. [YAML Option Reference](#3-yaml-option-reference)
 4. [KD Training](#4-kd-training)
-5. [Convert to Deployment Weights](#5-convert-to-deployment-weights)
-6. [Final Inference / Test](#6-final-inference--test)
-7. [Teacher Model Standalone Testing (Tiling Inference)](#7-teacher-model-standalone-testing-tiling-inference)
-8. [Architecture Notes](#8-architecture-notes)
+5. [Joint-Batch KD Training (H100 DDP)](#5-joint-batch-kd-training-h100-ddp)
+6. [Convert to Deployment Weights](#6-convert-to-deployment-weights)
+7. [Final Inference / Test](#7-final-inference--test)
+8. [Teacher Model Standalone Testing (Tiling Inference)](#8-teacher-model-standalone-testing-tiling-inference)
+9. [Architecture Notes](#9-architecture-notes)
 
 ---
 
@@ -296,7 +297,166 @@ Training outputs: `experiments/train_KD_RepSR_x3_10MB/`
 
 ---
 
-## 5. Convert to Deployment Weights
+---
+
+## 5. Joint-Batch KD Training (H100 DDP)
+
+두 가지 성격이 다른 데이터 스트림(Stream A: 열화 합성 + Stream B: 실제 LR)을 동시에 활용하는 **Joint-Batch KD 학습** 방법입니다.
+
+### 개요
+
+| | Stream A | Stream B |
+|---|---|---|
+| 데이터셋 타입 | `RealESRGANDataset` | `SingleLRDataset` |
+| 입력 | HR 이미지 | 생성형 모델의 실제 LR 이미지 |
+| Degradation | GPU에서 on-the-fly 합성 (blur → noise → JPEG) | **없음** (원본 그대로 사용) |
+| Loss | KD Feature + KD Output + (옵션) Pixel L1 vs GT | KD Feature + KD Output |
+| 목적 | 일반 화질 복원 및 Teacher 모방 | VAE artifact 제거용 KD |
+
+각 미니배치는 `JointBatchSampler`에 의해 **A : B = 1 : 1 비율**이 보장됩니다.
+
+### 전제 조건
+
+```bash
+# basicsr >= 1.4.2 (DiffJPEG, USMSharp 포함 버전)
+pip install basicsr --upgrade
+
+# YAML 내 lq_patch_size == degradation.gt_size // teacher_upscale 일치 필수
+# 예: gt_size=256, teacher x4 → lq_patch_size=64
+```
+
+### 데이터셋 구조
+
+```
+HAT/datasets/
+├── hr_images/          # Stream A: HR 이미지 폴더 (RealESRGANDataset)
+│   ├── img001.png
+│   └── ...
+├── generative_lr/      # Stream B: 생성형 모델 LR 이미지 폴더 (SingleLRDataset)
+│   ├── gen001.png
+│   └── ...
+└── Set5/, Set14/, ...  # 검증 데이터셋
+```
+
+### YAML 준비 (`options/train/train_KD_HAT_S_x4_joint.yml`)
+
+필수 경로 수정:
+
+```yaml
+datasets:
+  train_1:
+    dataroot_gt: /your/hr_images       # Stream A HR 이미지 폴더
+  train_2:
+    dataroot_lq: /your/generative_lr   # Stream B 실제 LR 이미지 폴더
+
+path:
+  pretrain_network_teacher: /your/Real_HAT_GAN_SRx4.pth  # 필수
+  pretrain_network_g: ~   # HAT-S warmup 체크포인트 (없으면 scratch)
+```
+
+핵심 파라미터 (`degradation` 섹션은 **Stream A에만** 적용됩니다):
+
+```yaml
+joint_batch_training: true   # JointBatchSampler 활성화 (필수)
+
+degradation:
+  gt_size: 256               # HR 패치 크기 → LQ = 256 // 4 = 64
+  # ... (이하 degradation 파라미터는 Stream B에 영향 없음)
+```
+
+### H100 단일 노드 8-GPU DDP 학습
+
+```bash
+# torchrun (권장, PyTorch ≥ 2.0)
+torchrun \
+    --standalone \
+    --nproc_per_node=8 \
+    hat/train.py \
+    -opt options/train/train_KD_HAT_S_x4_joint.yml \
+    --launcher pytorch
+```
+
+또는 `torch.distributed.launch` (구버전 호환):
+
+```bash
+python -m torch.distributed.launch \
+    --nproc_per_node=8 \
+    --master_port=4321 \
+    hat/train.py \
+    -opt options/train/train_KD_HAT_S_x4_joint.yml \
+    --launcher pytorch
+```
+
+### H100 멀티 노드 학습 (slurm 환경)
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=kd_hat_joint
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=8
+#SBATCH --gres=gpu:8
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=128G
+
+export MASTER_PORT=29500
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+
+srun torchrun \
+    --nnodes=$SLURM_NNODES \
+    --nproc_per_node=8 \
+    --rdzv_backend=c10d \
+    --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+    hat/train.py \
+    -opt options/train/train_KD_HAT_S_x4_joint.yml \
+    --launcher pytorch
+```
+
+### 재개 (Resume)
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+    hat/train.py \
+    -opt options/train/train_KD_HAT_S_x4_joint.yml \
+    --launcher pytorch \
+    --auto_resume
+```
+
+### 학습 중 모니터링
+
+```bash
+# TensorBoard (실험 폴더 안에 tb_logger/ 생성됨)
+tensorboard --logdir experiments/train_KD_HAT_S_x4_joint/tb_logger --port 6006
+
+# 학습 로그 실시간 확인
+tail -f experiments/train_KD_HAT_S_x4_joint/train_train_KD_HAT_S_x4_joint_*.log
+```
+
+TensorBoard에서 확인 가능한 항목:
+- `train/lq_bicubic`, `train/teacher_pseudo_gt`, `train/student_output` — 학습 샘플 시각화 (매 `tb_train_vis_freq` iter)
+- `val/{dataset}/{img}_lq_bicubic`, `val/{dataset}/{img}_teacher`, `val/{dataset}/{img}_student` — 검증 시각화
+- 손실: `l_kd_feat`, `l_kd_out`, `l_pix`, `l_total`
+
+### 배치 구성 예시 (batch_size_per_gpu=16, world_size=8)
+
+```
+총 배치 크기 = 16 × 8 = 128 samples
+  → Stream A (RealESRGAN) : 64 samples — HR + kernels → GPU degradation → LQ
+  → Stream B (SingleLR)   : 64 samples — 실제 LR 이미지 그대로 사용
+
+모델 forward:
+  self.lq = cat(lq_A, lq_B)   # shape: (128, 3, 64, 64)
+  pseudo_gt = teacher(lq)      # shape: (128, 3, 256, 256) → (128, 3, 256, 256)
+  student_out = student(lq)    # shape: (128, 3, 256, 256)
+
+손실:
+  l_kd_feat = MSE(proj(feat_S), feat_T)         # 전체 128개 샘플
+  l_kd_out  = L1(student_out, pseudo_gt)         # 전체 128개 샘플
+  l_pix     = L1(student_out[:64], gt_usm[:64])  # Stream A 64개 샘플만
+```
+
+---
+
+## 6. Convert to Deployment Weights
 
 After training, fuse all multi-branch RepSRBlocks into single 3x3 convolutions
 using `scripts/convert_rep_sr.py`.
@@ -338,7 +498,7 @@ model.eval()
 
 ---
 
-## 6. Final Inference / Test
+## 7. Final Inference / Test
 
 Edit `options/test/test_KD_RepSR_x4.yml` and set the student checkpoint path:
 
@@ -367,7 +527,7 @@ tile:
 
 ---
 
-## 7. Teacher Model Standalone Testing (Tiling Inference)
+## 8. Teacher Model Standalone Testing (Tiling Inference)
 
 Use `scripts/inference_teacher_tiling.py` to evaluate a Teacher model
 (HAT, MambaIRv2, etc.) **independently** -- without loading the student or
@@ -533,7 +693,7 @@ python scripts/inference_teacher_tiling.py \
 
 ---
 
-## 8. End-to-End Experiment Example (x4 SR, HAT Teacher)
+## 9. End-to-End Experiment Example (x4 SR, HAT Teacher)
 
 아래는 HAT teacher + RepSR student, scale×4, GPU 1장 기준으로 처음부터 끝까지 실행하는 전체 명령어 예시입니다.
 
@@ -645,7 +805,7 @@ python hat/test.py -opt options/test/test_KD_RepSR_x4.yml
 
 ---
 
-## 9. Architecture Notes
+## 10. Architecture Notes
 
 ### RepSR
 
@@ -693,11 +853,13 @@ Set `type: MambaIRv2` in `network_teacher:` to use it as the teacher.
 | `hat/archs/rep_sr_arch.py` | RepSR student architecture |
 | `hat/archs/mambairv2_arch.py` | MambaIRv2 teacher architecture |
 | `hat/data/single_lr_dataset.py` | LR-only dataset (no resize, teacher generates GT) |
-| `hat/models/kd_sr_model.py` | KD training + tiled inference model |
-| `options/train/train_KD_RepSR_x4.yml` | Training configuration |
+| `hat/data/joint_batch_sampler.py` | `JointBatchSampler`, `StreamTaggedDataset`, `joint_collate_fn` |
+| `hat/models/kd_sr_model.py` | KD training + tiled inference + Joint-Batch degradation |
+| `options/train/train_KD_RepSR_x4.yml` | Training config: RepSR student + HAT/MambaIRv2 teacher |
+| `options/train/train_KD_HAT_S_x4_joint.yml` | Joint-Batch training config: HAT-S student + HAT-L teacher |
 | `options/test/test_KD_RepSR_x4.yml` | Test / inference configuration |
 | `scripts/convert_rep_sr.py` | Reparameterization & export script |
-| `scripts/inference_teacher_tiling.py` | Teacher standalone SR with crop-and-paste tiling |
+| `scripts/inference_teacher_tiling.py` | Teacher standalone SR with linear-blend tiling |
 | `options/inference/teacher_hat_x3.yml` | Example YAML for HAT x3 teacher inference |
 | `options/inference/teacher_mambairv2_small_x3.yml` | Example YAML for MambaIRv2 Small x3 teacher inference |
 
