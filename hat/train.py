@@ -201,12 +201,40 @@ def _create_train_val_dataloader(opt, logger):
 
     train_sampler = EnlargedSampler(
         train_set, opt['world_size'], opt['rank'], dataset_enlarge_ratio)
-    train_loader = build_dataloader(
-        train_set, loader_opt,
-        num_gpu=opt['num_gpu'],
-        dist=opt['dist'],
-        sampler=train_sampler,
-        seed=opt['manual_seed'])
+
+    # When any training dataset enables probabilistic paired-LQ bypass
+    # (prob_paired_lq > 0), a single batch can contain samples from both
+    # the bypass path {gt, lq} and the degradation path {gt, kernel1, ...}.
+    # These have different key sets, so default_collate would fail.
+    # joint_collate_fn handles heterogeneous dicts gracefully (missing keys
+    # become None-padded lists) so the model's feed_data can detect each path.
+    needs_joint_collate = any(
+        float(dopt.get('prob_paired_lq', 0.0)) > 0
+        for dopt in train_opts
+    )
+
+    if needs_joint_collate:
+        num_workers = loader_opt.get('num_worker_per_gpu', 4) * opt['num_gpu']
+        train_loader = DataLoader(
+            train_set,
+            batch_size=loader_opt['batch_size_per_gpu'],
+            sampler=train_sampler,
+            num_workers=num_workers,
+            collate_fn=joint_collate_fn,
+            pin_memory=loader_opt.get('pin_memory', False),
+            drop_last=True,
+            persistent_workers=(num_workers > 0),
+        )
+        logger.info(
+            'joint_collate_fn activated for prob_paired_lq > 0 '
+            '(heterogeneous batch keys detected).')
+    else:
+        train_loader = build_dataloader(
+            train_set, loader_opt,
+            num_gpu=opt['num_gpu'],
+            dist=opt['dist'],
+            sampler=train_sampler,
+            seed=opt['manual_seed'])
 
     num_iter_per_epoch = math.ceil(
         len(train_set) * dataset_enlarge_ratio

@@ -56,6 +56,39 @@ class RealESRGANDataset(data.Dataset):
         else:
             self.paths = sorted(list(scandir(self.gt_folder, full_path=True)))
 
+        # ── Step 1: Paired LQ bypass ──────────────────────────────────────────
+        # If `dataroot_lq` is given in the YAML and `prob_paired_lq` > 0,
+        # a fraction of __getitem__ calls will bypass on-the-fly degradation
+        # and load a real paired LQ image directly (supervised learning).
+        # When the probability fires, GT and LQ are jointly augmented/cropped
+        # so that they remain spatially aligned.
+        #
+        # Required YAML keys (in dataset section):
+        #   dataroot_lq    : path to folder containing real paired LQ images
+        #   prob_paired_lq : float in [0, 1], default 0.0
+        #   scale          : SR upscale factor (needed for synchronized crop)
+        self.lq_folder = opt.get('dataroot_lq', None)
+        self.prob_paired_lq = float(opt.get('prob_paired_lq', 0.0))
+        self.scale = opt.get('scale', 4)   # used to compute LQ pad size
+        self.paths_lq = None
+
+        if self.lq_folder is not None and self.prob_paired_lq > 0:
+            self.paths_lq = sorted(list(scandir(self.lq_folder, full_path=True)))
+            if not self.paths_lq:
+                raise ValueError(
+                    f'RealESRGANDataset: No LQ images found in '
+                    f'dataroot_lq: {self.lq_folder}')
+            logger = get_root_logger()
+            logger.info(
+                f'RealESRGANDataset: probabilistic paired-LQ bypass enabled. '
+                f'GT={len(self.paths)} / LQ={len(self.paths_lq)} images, '
+                f'prob_paired_lq={self.prob_paired_lq}')
+        elif self.lq_folder is not None and self.prob_paired_lq == 0:
+            logger = get_root_logger()
+            logger.warning(
+                'RealESRGANDataset: dataroot_lq is set but prob_paired_lq=0. '
+                'Paired LQ bypass is effectively disabled.')
+
         # blur settings for the first degradation
         self.blur_kernel_size = opt['blur_kernel_size']
         self.kernel_list = opt['kernel_list']
@@ -107,13 +140,45 @@ class RealESRGANDataset(data.Dataset):
                 retry -= 1
         img_gt = imfrombytes(img_bytes, float32=True)
 
-        # -------------------- Do augmentation for training: flip, rotation -------------------- #
-        img_gt = augment(img_gt, self.opt['use_hflip'], self.opt['use_rot'])
+        # ── Step 2a: Decide bypass vs. degradation BEFORE augmentation ────────
+        # Bypass fires when dataroot_lq is configured AND the random draw wins.
+        use_bypass = (
+            self.paths_lq is not None
+            and random.random() < self.prob_paired_lq
+        )
+        img_lq = None
+        lq_path = None
 
-        # crop or pad to 400
+        if use_bypass:
+            # Load the paired LQ image (index is cycled if datasets differ in size)
+            lq_idx = index % len(self.paths_lq)
+            lq_path = self.paths_lq[lq_idx]
+            try:
+                lq_bytes = self.file_client.get(lq_path, 'lq')
+                img_lq = imfrombytes(lq_bytes, float32=True)
+            except (IOError, OSError):
+                # Fall back to degradation path if the paired LQ cannot be loaded
+                use_bypass = False
+                img_lq = None
+
+        # ── Step 2b: Augmentation — apply SAME transforms to GT (and LQ) ─────
+        # augment() accepts a list; both images receive identical flip/rotation.
+        if use_bypass and img_lq is not None:
+            img_gt, img_lq = augment(
+                [img_gt, img_lq],
+                self.opt['use_hflip'],
+                self.opt.get('use_rot', False)
+            )
+        else:
+            img_gt = augment(img_gt, self.opt['use_hflip'], self.opt['use_rot'])
+
+        # ── Step 2c: Pad/crop GT to crop_pad_size — track coordinates ────────
+        # gt_top / gt_left are used to compute the synchronized LQ crop below.
         # TODO: 400 is hard-coded. You may change it accordingly
         h, w = img_gt.shape[0:2]
         crop_pad_size = 400
+        gt_top, gt_left = 0, 0
+
         # pad
         if h < crop_pad_size or w < crop_pad_size:
             pad_h = max(0, crop_pad_size - h)
@@ -123,9 +188,46 @@ class RealESRGANDataset(data.Dataset):
         if img_gt.shape[0] > crop_pad_size or img_gt.shape[1] > crop_pad_size:
             h, w = img_gt.shape[0:2]
             # randomly choose top and left coordinates
-            top = random.randint(0, h - crop_pad_size)
-            left = random.randint(0, w - crop_pad_size)
-            img_gt = img_gt[top:top + crop_pad_size, left:left + crop_pad_size, ...]
+            gt_top = random.randint(0, h - crop_pad_size)
+            gt_left = random.randint(0, w - crop_pad_size)
+            img_gt = img_gt[gt_top:gt_top + crop_pad_size, gt_left:gt_left + crop_pad_size, ...]
+
+        # ── Step 2d: Paired LQ bypass — synchronized crop and early return ────
+        if use_bypass and img_lq is not None:
+            # LQ target pad size (mirrors GT pad size at LR resolution)
+            lq_pad = crop_pad_size // self.scale  # e.g. 400 // 4 = 100
+
+            h_lq, w_lq = img_lq.shape[:2]
+
+            # Pad LQ to lq_pad if smaller
+            if h_lq < lq_pad or w_lq < lq_pad:
+                img_lq = cv2.copyMakeBorder(
+                    img_lq,
+                    0, max(0, lq_pad - h_lq),
+                    0, max(0, lq_pad - w_lq),
+                    cv2.BORDER_REFLECT_101
+                )
+                h_lq, w_lq = img_lq.shape[:2]
+
+            # Synchronized crop: GT crop coords scaled down to LR space.
+            # Clamped so the slice never exceeds the LQ image boundary.
+            lq_top  = min(gt_top  // self.scale, max(0, h_lq - lq_pad))
+            lq_left = min(gt_left // self.scale, max(0, w_lq - lq_pad))
+            img_lq = img_lq[lq_top:lq_top + lq_pad, lq_left:lq_left + lq_pad, ...]
+
+            # BGR → RGB, HWC → CHW
+            img_gt = img2tensor([img_gt], bgr2rgb=True, float32=True)[0]
+            img_lq = img2tensor([img_lq], bgr2rgb=True, float32=True)[0]
+
+            return {
+                'gt': img_gt,
+                'lq': img_lq,
+                'gt_path': gt_path,
+                'lq_path': lq_path,
+                'use_paired_lq': torch.tensor(1, dtype=torch.int),
+            }
+
+        # ── Degradation path (unchanged) — falls through to kernel generation ─
 
         # ------------------------ Generate kernels (used in the first degradation) ------------------------ #
         kernel_size = random.choice(self.kernel_range)
@@ -187,7 +289,15 @@ class RealESRGANDataset(data.Dataset):
         kernel = torch.FloatTensor(kernel)
         kernel2 = torch.FloatTensor(kernel2)
 
-        return_d = {'gt': img_gt, 'kernel1': kernel, 'kernel2': kernel2, 'sinc_kernel': sinc_kernel, 'gt_path': gt_path}
+        return_d = {
+            'gt': img_gt,
+            'kernel1': kernel,
+            'kernel2': kernel2,
+            'sinc_kernel': sinc_kernel,
+            'gt_path': gt_path,
+            # Step 2: flag so feed_data can distinguish this path from bypass
+            'use_paired_lq': torch.tensor(0, dtype=torch.int),
+        }
         return return_d
 
     def __len__(self):

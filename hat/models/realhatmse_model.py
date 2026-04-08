@@ -66,7 +66,32 @@ class RealHATMSEModel(SRModel):
     @torch.no_grad()
     def feed_data(self, data):
         """Accept data from dataloader, and then add two-order degradations to obtain LQ images.
+
+        Supports three data formats:
+          1. Standard degradation batch (from RealESRGANDataset degradation path):
+             data has 'gt', 'kernel1', 'kernel2', 'sinc_kernel'; 'use_paired_lq'=0.
+          2. Paired LQ bypass batch (from RealESRGANDataset bypass path):
+             data has 'gt', 'lq'; 'use_paired_lq'=1.  GPU synthesis is skipped.
+          3. Legacy paired batch (high_order_degradation=False):
+             data has 'lq' and optionally 'gt'.
         """
+        # ── Paired LQ bypass: all samples in batch have real LQ, skip synthesis ──
+        use_paired = data.get('use_paired_lq', None)
+        if (use_paired is not None
+                and isinstance(use_paired, torch.Tensor)
+                and use_paired.all()):
+            # Every sample in this batch took the bypass path.
+            self.gt = data['gt'].to(self.device)
+            if self.opt.get('gt_usm', True):
+                self.gt = self.usm_sharpener(self.gt)
+            self.lq = data['lq'].to(self.device)
+            # Further crop to gt_size × gt_size / lq_size × lq_size
+            gt_size = self.opt['gt_size']
+            self.gt, self.lq = paired_random_crop(self.gt, self.lq, gt_size, self.opt['scale'])
+            self._dequeue_and_enqueue()
+            self.lq = self.lq.contiguous()
+            return
+
         if self.is_train and self.opt.get('high_order_degradation', True):
             # training data synthesis
             self.gt = data['gt'].to(self.device)
