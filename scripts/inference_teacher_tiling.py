@@ -231,7 +231,8 @@ def tiled_sr(model: torch.nn.Module,
              tile_overlap: int,
              upscale: int,
              window_size: int = 1,
-             tile_batch_size: int = 16) -> torch.Tensor:
+             tile_batch_size: int = 16,
+             use_bf16: bool = False) -> torch.Tensor:
     """Run SR inference with batched Linear-Blending (Feathering) tiling.
 
     Replaces the previous Crop-and-Paste approach with weight-accumulation
@@ -326,8 +327,8 @@ def tiled_sr(model: torch.nn.Module,
     # Expand for broadcasting with (B, C, hr_tile, hr_tile)
     blend_bc = blend.unsqueeze(0).unsqueeze(0)   # (1, 1, hr_tile, hr_tile)
 
-    # BF16 autocast on CUDA → H100 Tensor Core utilisation
-    use_bf16 = (device.type == 'cuda')
+    # BF16 autocast: enabled only when caller requests it AND device supports it
+    use_bf16 = use_bf16 and (device.type == 'cuda')
 
     # ---- 5. Forward in mini-batches, accumulate with blend mask --------------
     for batch_start in range(0, n_total, tile_batch_size):
@@ -396,6 +397,7 @@ def main() -> None:
     tile_overlap    = int(cfg.get('tile_overlap',    32))
     tile_batch_size = int(cfg.get('tile_batch_size', 16))
     upscale         = int(cfg.get('scale',           4))
+    use_bf16        = bool(cfg.get('use_bf16',       False))
 
     if not input_dir:
         raise ValueError(
@@ -422,11 +424,11 @@ def main() -> None:
     window_size   = getattr(teacher_inner, 'window_size', 1)
     n_params      = sum(p.numel() for p in model.parameters()) / 1e6
 
+    bf16_status = 'on' if (use_bf16 and device.type == 'cuda') else 'off'
     print(f'[inference_teacher_tiling] Teacher: {cfg["network_t"]["type"]} | '
           f'{n_params:.2f} M params | scale x{upscale} | '
           f'tile={tile_size} overlap={tile_overlap} batch={tile_batch_size} '
-          f'window={window_size} | device={device} | '
-          f'bf16={"on" if device.type == "cuda" else "off"}')
+          f'window={window_size} | device={device} | bf16={bf16_status}')
 
     # ---- Prepare output directory -------------------------------------------
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -450,6 +452,7 @@ def main() -> None:
             upscale=upscale,
             window_size=window_size,
             tile_batch_size=tile_batch_size,
+            use_bf16=use_bf16,
         )
 
         sr_img = tensor_to_img_bgr(sr)

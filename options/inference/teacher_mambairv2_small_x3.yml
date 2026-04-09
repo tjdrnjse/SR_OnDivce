@@ -25,6 +25,7 @@ tile_batch_size: 16  # tiles forwarded per model call (increase on high-VRAM GPU
 input_dir:  datasets/my_lr_images
 output_dir: results/teacher_mambairv2_small_x3
 device:     cuda   # cuda | cpu
+use_bf16:   false  # true = BF16 autocast (CUDA only, requires Ampere+ GPU)
 
 # ---- Teacher network (MambaIRv2 Small x3) -------------------
 # Reference: https://github.com/csguoh/MambaIR
