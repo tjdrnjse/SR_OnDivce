@@ -63,29 +63,131 @@ class RealHATMSEModel(SRModel):
             self.queue_gt[self.queue_ptr:self.queue_ptr + b, :, :, :] = self.gt.clone()
             self.queue_ptr = self.queue_ptr + b
 
+    @staticmethod
+    def _collect_tensor(val, indices=None):
+        """Extract a stacked tensor from either a batched Tensor or a list-with-Nones.
+
+        joint_collate_fn may produce a list where some entries are None (missing key
+        for that sample). This helper gracefully handles both cases.
+
+        Args:
+            val: torch.Tensor (standard collation) or list (joint_collate_fn output)
+            indices: optional 1-D LongTensor or list of int to select rows
+
+        Returns:
+            torch.Tensor with selected rows stacked on dim-0
+        """
+        if isinstance(val, torch.Tensor):
+            if indices is None:
+                return val
+            return val[indices]
+        # list path — filter out None entries at the requested indices
+        idx_list = indices.tolist() if isinstance(indices, torch.Tensor) else (
+            list(range(len(val))) if indices is None else list(indices)
+        )
+        items = [val[i] for i in idx_list if val[i] is not None]
+        return torch.stack(items)
+
+    @torch.no_grad()
+    def _run_degradation(self, gt, kernel1, kernel2, sinc_kernel):
+        """Run the two-stage RealESRGAN degradation pipeline on a GT batch.
+
+        Args:
+            gt: (B, C, H, W) GPU tensor — already USM-sharpened if requested
+            kernel1, kernel2, sinc_kernel: (B, k, k) GPU tensors
+
+        Returns:
+            lq: (B, C, H//scale, W//scale) GPU tensor, clamped & rounded
+        """
+        ori_h, ori_w = gt.size()[2:4]
+
+        # ---- First degradation ----
+        out = filter2D(gt, kernel1)
+        updown_type = random.choices(['up', 'down', 'keep'], self.opt['resize_prob'])[0]
+        if updown_type == 'up':
+            scale = np.random.uniform(1, self.opt['resize_range'][1])
+        elif updown_type == 'down':
+            scale = np.random.uniform(self.opt['resize_range'][0], 1)
+        else:
+            scale = 1
+        mode = random.choice(['area', 'bilinear', 'bicubic'])
+        out = F.interpolate(out, scale_factor=scale, mode=mode)
+        gray_noise_prob = self.opt['gray_noise_prob']
+        if np.random.uniform() < self.opt['gaussian_noise_prob']:
+            out = random_add_gaussian_noise_pt(
+                out, sigma_range=self.opt['noise_range'], clip=True, rounds=False, gray_prob=gray_noise_prob)
+        else:
+            out = random_add_poisson_noise_pt(
+                out, scale_range=self.opt['poisson_scale_range'],
+                gray_prob=gray_noise_prob, clip=True, rounds=False)
+        jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt['jpeg_range'])
+        out = torch.clamp(out, 0, 1)
+        out = self.jpeger(out, quality=jpeg_p)
+
+        # ---- Second degradation ----
+        if np.random.uniform() < self.opt['second_blur_prob']:
+            out = filter2D(out, kernel2)
+        updown_type = random.choices(['up', 'down', 'keep'], self.opt['resize_prob2'])[0]
+        if updown_type == 'up':
+            scale = np.random.uniform(1, self.opt['resize_range2'][1])
+        elif updown_type == 'down':
+            scale = np.random.uniform(self.opt['resize_range2'][0], 1)
+        else:
+            scale = 1
+        mode = random.choice(['area', 'bilinear', 'bicubic'])
+        out = F.interpolate(
+            out,
+            size=(int(ori_h / self.opt['scale'] * scale), int(ori_w / self.opt['scale'] * scale)),
+            mode=mode)
+        gray_noise_prob = self.opt['gray_noise_prob2']
+        if np.random.uniform() < self.opt['gaussian_noise_prob2']:
+            out = random_add_gaussian_noise_pt(
+                out, sigma_range=self.opt['noise_range2'], clip=True, rounds=False, gray_prob=gray_noise_prob)
+        else:
+            out = random_add_poisson_noise_pt(
+                out, scale_range=self.opt['poisson_scale_range2'],
+                gray_prob=gray_noise_prob, clip=True, rounds=False)
+
+        # JPEG + sinc (two orderings)
+        if np.random.uniform() < 0.5:
+            mode = random.choice(['area', 'bilinear', 'bicubic'])
+            out = F.interpolate(out, size=(ori_h // self.opt['scale'], ori_w // self.opt['scale']), mode=mode)
+            out = filter2D(out, sinc_kernel)
+            jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt['jpeg_range2'])
+            out = torch.clamp(out, 0, 1)
+            out = self.jpeger(out, quality=jpeg_p)
+        else:
+            jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt['jpeg_range2'])
+            out = torch.clamp(out, 0, 1)
+            out = self.jpeger(out, quality=jpeg_p)
+            mode = random.choice(['area', 'bilinear', 'bicubic'])
+            out = F.interpolate(out, size=(ori_h // self.opt['scale'], ori_w // self.opt['scale']), mode=mode)
+            out = filter2D(out, sinc_kernel)
+
+        lq = torch.clamp((out * 255.0).round(), 0, 255) / 255.
+        return lq
+
     @torch.no_grad()
     def feed_data(self, data):
         """Accept data from dataloader, and then add two-order degradations to obtain LQ images.
 
         Supports three data formats:
-          1. Standard degradation batch (from RealESRGANDataset degradation path):
-             data has 'gt', 'kernel1', 'kernel2', 'sinc_kernel'; 'use_paired_lq'=0.
-          2. Paired LQ bypass batch (from RealESRGANDataset bypass path):
-             data has 'gt', 'lq'; 'use_paired_lq'=1.  GPU synthesis is skipped.
-          3. Legacy paired batch (high_order_degradation=False):
-             data has 'lq' and optionally 'gt'.
+          1. All-degradation batch: every sample has kernel1/kernel2/sinc_kernel; use_paired_lq=0.
+          2. All-bypass batch: every sample has 'lq'; use_paired_lq=1.  GPU synthesis is skipped.
+          3. Mixed batch: some samples are bypass (use_paired_lq=1), others are degradation
+             (use_paired_lq=0). Produced when prob_paired_lq in (0, 1) with standard DataLoader.
+          4. Legacy paired batch (high_order_degradation=False): has 'lq' and optionally 'gt'.
         """
-        # ── Paired LQ bypass: all samples in batch have real LQ, skip synthesis ──
         use_paired = data.get('use_paired_lq', None)
+
+        # ── Case 1: All-bypass — every sample took the real-LQ path ─────────────
         if (use_paired is not None
                 and isinstance(use_paired, torch.Tensor)
                 and use_paired.all()):
-            # Every sample in this batch took the bypass path.
             self.gt = data['gt'].to(self.device)
             if self.opt.get('gt_usm', True):
                 self.gt = self.usm_sharpener(self.gt)
             self.lq = data['lq'].to(self.device)
-            # Further crop to gt_size × gt_size / lq_size × lq_size
             gt_size = self.opt['gt_size']
             self.gt, self.lq = paired_random_crop(self.gt, self.lq, gt_size, self.opt['scale'])
             self._dequeue_and_enqueue()
@@ -93,112 +195,66 @@ class RealHATMSEModel(SRModel):
             return
 
         if self.is_train and self.opt.get('high_order_degradation', True):
-            # training data synthesis
+
+            # ── Case 2: Mixed batch — split by bypass_mask, process separately ──
+            if use_paired is not None and isinstance(use_paired, torch.Tensor) and use_paired.any():
+                bypass_mask = use_paired.bool()          # True  → real LQ
+                degrad_mask = ~bypass_mask               # False → synthesize
+                bypass_idx = torch.where(bypass_mask)[0]
+                degrad_idx  = torch.where(degrad_mask)[0]
+
+                gt_all = data['gt'].to(self.device)
+                if self.opt.get('gt_usm', True):
+                    gt_all = self.usm_sharpener(gt_all)
+
+                gt_size   = self.opt['gt_size']
+                lq_size   = gt_size // self.opt['scale']
+                B, C, H, W = gt_all.shape
+
+                final_gt = torch.empty(B, C, gt_size, gt_size, device=self.device)
+                final_lq = torch.empty(B, C, lq_size,  lq_size,  device=self.device)
+
+                # --- bypass sub-batch ---
+                if bypass_idx.numel() > 0:
+                    gt_bp = gt_all[bypass_idx]
+                    lq_bp = self._collect_tensor(data['lq'], bypass_idx).to(self.device)
+                    gt_bp, lq_bp = paired_random_crop(gt_bp, lq_bp, gt_size, self.opt['scale'])
+                    final_gt[bypass_idx] = gt_bp
+                    final_lq[bypass_idx] = lq_bp
+
+                # --- degradation sub-batch ---
+                if degrad_idx.numel() > 0:
+                    gt_dg = gt_all[degrad_idx]
+                    k1   = self._collect_tensor(data['kernel1'],    degrad_idx).to(self.device)
+                    k2   = self._collect_tensor(data['kernel2'],    degrad_idx).to(self.device)
+                    sinc = self._collect_tensor(data['sinc_kernel'], degrad_idx).to(self.device)
+                    lq_dg = self._run_degradation(gt_dg, k1, k2, sinc)
+                    gt_dg, lq_dg = paired_random_crop(gt_dg, lq_dg, gt_size, self.opt['scale'])
+                    final_gt[degrad_idx] = gt_dg
+                    final_lq[degrad_idx] = lq_dg
+
+                self.gt = final_gt
+                self.lq = final_lq
+                self._dequeue_and_enqueue()
+                self.lq = self.lq.contiguous()
+                return
+
+            # ── Case 3: All-degradation batch ────────────────────────────────────
             self.gt = data['gt'].to(self.device)
-            # USM sharpen the GT images
             if self.opt['gt_usm'] is True:
                 self.gt = self.usm_sharpener(self.gt)
 
-            self.kernel1 = data['kernel1'].to(self.device)
-            self.kernel2 = data['kernel2'].to(self.device)
-            self.sinc_kernel = data['sinc_kernel'].to(self.device)
+            kernel1     = self._collect_tensor(data['kernel1']).to(self.device)
+            kernel2     = self._collect_tensor(data['kernel2']).to(self.device)
+            sinc_kernel = self._collect_tensor(data['sinc_kernel']).to(self.device)
 
-            ori_h, ori_w = self.gt.size()[2:4]
+            self.lq = self._run_degradation(self.gt, kernel1, kernel2, sinc_kernel)
 
-            # ----------------------- The first degradation process ----------------------- #
-            # blur
-            out = filter2D(self.gt, self.kernel1)
-            # random resize
-            updown_type = random.choices(['up', 'down', 'keep'], self.opt['resize_prob'])[0]
-            if updown_type == 'up':
-                scale = np.random.uniform(1, self.opt['resize_range'][1])
-            elif updown_type == 'down':
-                scale = np.random.uniform(self.opt['resize_range'][0], 1)
-            else:
-                scale = 1
-            mode = random.choice(['area', 'bilinear', 'bicubic'])
-            out = F.interpolate(out, scale_factor=scale, mode=mode)
-            # add noise
-            gray_noise_prob = self.opt['gray_noise_prob']
-            if np.random.uniform() < self.opt['gaussian_noise_prob']:
-                out = random_add_gaussian_noise_pt(
-                    out, sigma_range=self.opt['noise_range'], clip=True, rounds=False, gray_prob=gray_noise_prob)
-            else:
-                out = random_add_poisson_noise_pt(
-                    out,
-                    scale_range=self.opt['poisson_scale_range'],
-                    gray_prob=gray_noise_prob,
-                    clip=True,
-                    rounds=False)
-            # JPEG compression
-            jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt['jpeg_range'])
-            out = torch.clamp(out, 0, 1)  # clamp to [0, 1], otherwise JPEGer will result in unpleasant artifacts
-            out = self.jpeger(out, quality=jpeg_p)
-
-            # ----------------------- The second degradation process ----------------------- #
-            # blur
-            if np.random.uniform() < self.opt['second_blur_prob']:
-                out = filter2D(out, self.kernel2)
-            # random resize
-            updown_type = random.choices(['up', 'down', 'keep'], self.opt['resize_prob2'])[0]
-            if updown_type == 'up':
-                scale = np.random.uniform(1, self.opt['resize_range2'][1])
-            elif updown_type == 'down':
-                scale = np.random.uniform(self.opt['resize_range2'][0], 1)
-            else:
-                scale = 1
-            mode = random.choice(['area', 'bilinear', 'bicubic'])
-            out = F.interpolate(
-                out, size=(int(ori_h / self.opt['scale'] * scale), int(ori_w / self.opt['scale'] * scale)), mode=mode)
-            # add noise
-            gray_noise_prob = self.opt['gray_noise_prob2']
-            if np.random.uniform() < self.opt['gaussian_noise_prob2']:
-                out = random_add_gaussian_noise_pt(
-                    out, sigma_range=self.opt['noise_range2'], clip=True, rounds=False, gray_prob=gray_noise_prob)
-            else:
-                out = random_add_poisson_noise_pt(
-                    out,
-                    scale_range=self.opt['poisson_scale_range2'],
-                    gray_prob=gray_noise_prob,
-                    clip=True,
-                    rounds=False)
-
-            # JPEG compression + the final sinc filter
-            # We also need to resize images to desired sizes. We group [resize back + sinc filter] together
-            # as one operation.
-            # We consider two orders:
-            #   1. [resize back + sinc filter] + JPEG compression
-            #   2. JPEG compression + [resize back + sinc filter]
-            # Empirically, we find other combinations (sinc + JPEG + Resize) will introduce twisted lines.
-            if np.random.uniform() < 0.5:
-                # resize back + the final sinc filter
-                mode = random.choice(['area', 'bilinear', 'bicubic'])
-                out = F.interpolate(out, size=(ori_h // self.opt['scale'], ori_w // self.opt['scale']), mode=mode)
-                out = filter2D(out, self.sinc_kernel)
-                # JPEG compression
-                jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt['jpeg_range2'])
-                out = torch.clamp(out, 0, 1)
-                out = self.jpeger(out, quality=jpeg_p)
-            else:
-                # JPEG compression
-                jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt['jpeg_range2'])
-                out = torch.clamp(out, 0, 1)
-                out = self.jpeger(out, quality=jpeg_p)
-                # resize back + the final sinc filter
-                mode = random.choice(['area', 'bilinear', 'bicubic'])
-                out = F.interpolate(out, size=(ori_h // self.opt['scale'], ori_w // self.opt['scale']), mode=mode)
-                out = filter2D(out, self.sinc_kernel)
-
-            # clamp and round
-            self.lq = torch.clamp((out * 255.0).round(), 0, 255) / 255.
-
-            # random crop
             gt_size = self.opt['gt_size']
             self.gt, self.lq = paired_random_crop(self.gt, self.lq, gt_size, self.opt['scale'])
-
-            # training pair pool
             self._dequeue_and_enqueue()
-            self.lq = self.lq.contiguous()  # for the warning: grad and param do not obey the gradient layout contract
+            self.lq = self.lq.contiguous()
+
         else:
             # for paired training or validation
             self.lq = data['lq'].to(self.device)
@@ -211,7 +267,7 @@ class RealHATMSEModel(SRModel):
         self.is_train = False
         super(RealHATMSEModel, self).nondist_validation(dataloader, current_iter, tb_logger, save_img)
         self.is_train = True
-    
+
     def test(self):
         # pad to multiplication of window_size
         window_size = self.opt['network_g']['window_size']
