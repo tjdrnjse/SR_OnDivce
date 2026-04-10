@@ -202,15 +202,20 @@ train:
     loss_weight: 0.5
     reduction: mean
 
-  # ── Feature-level KD (FitNet MSE) — applied to all samples ───────────────
+  # ── KD loss mode (set loss_weight: 0.0 or omit a block to disable it) ──
+  #   Output-only  → keep kd_output_opt, remove/zero kd_feat_opt
+  #   Feature-only → keep kd_feat_opt,   remove/zero kd_output_opt
+  #   Both         → keep both (current setting)
+
+  # Feature-level KD (FitNet MSE) — applied to all samples
   kd_feat_opt:
     loss_weight: 0.1
 
-  # ── Output-level KD (L1 vs teacher pseudo-GT) — applied to all samples ───
+  # Output-level KD (L1 vs teacher pseudo-GT) — applied to all samples
   kd_output_opt:
     loss_weight: 1.0
 
-  # ── Feature channel dims ──────────────────────────────────────────────────
+  # ── Feature channel dims (required only when kd_feat_opt is active) ──────
   student_feat_channels: 64   # HAT conv_before_upsample always outputs 64ch
   teacher_feat_channels: 64
 

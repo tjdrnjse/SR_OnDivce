@@ -133,12 +133,17 @@ train:
   total_iter: 400000
   warmup_iter: -1
 
-  # ── Feature-level KD (FitNet MSE) ───────────────────────────
+  # ── KD loss mode (set loss_weight: 0.0 or omit a block to disable it) ──
+  #   Output-only  → keep kd_output_opt, remove/zero kd_feat_opt
+  #   Feature-only → keep kd_feat_opt,   remove/zero kd_output_opt
+  #   Both         → keep both (current setting)
+
+  # Feature-level KD (FitNet MSE)
   # Low weight to avoid over-fitting to GAN teacher's sharp texture artifacts
   kd_feat_opt:
     loss_weight: 0.1
 
-  # ── Output-level KD (L1 vs teacher pseudo-GT) ───────────────
+  # Output-level KD (L1 vs teacher pseudo-GT)
   # Teacher pseudo-GT is bicubic-downsampled from x4 to x3 resolution
   kd_output_opt:
     loss_weight: 1.0

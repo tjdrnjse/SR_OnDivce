@@ -153,13 +153,16 @@ train:
   total_iter: 400000
   warmup_iter: -1    # no warm-up
 
-  # ── Feature-level KD loss (FitNet MSE) ──────────────────────
-  # Aligns student conv_body features (projected) with teacher
-  # conv_before_upsample features.
+  # ── KD loss mode (set loss_weight: 0.0 or omit a block to disable it) ──
+  #   Output-only  → keep kd_output_opt, remove/zero kd_feat_opt
+  #   Feature-only → keep kd_feat_opt,   remove/zero kd_output_opt
+  #   Both         → keep both (current setting)
+
+  # Feature-level KD (FitNet MSE): student conv_body → projected → teacher conv_before_upsample
   kd_feat_opt:
     loss_weight: 1.0
 
-  # ── Output-level KD loss (L1 vs teacher Pseudo-GT) ──────────
+  # Output-level KD (L1 vs teacher pseudo-GT)
   kd_output_opt:
     loss_weight: 1.0
 

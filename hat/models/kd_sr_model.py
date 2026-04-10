@@ -236,36 +236,49 @@ class KDSRModel(SRModel):
         self.net_teacher.eval()
 
         # ------------------------------------------------------------------ #
-        # Feature hooks                                                        #
+        # KD mode flags and loss weights                                       #
+        # ------------------------------------------------------------------ #
+        train_opt = opt.get('train', {})
+        self.kd_feat_weight   = float(
+            train_opt.get('kd_feat_opt',   {}).get('loss_weight', 0.0)
+        )
+        self.kd_output_weight = float(
+            train_opt.get('kd_output_opt', {}).get('loss_weight', 0.0)
+        )
+        # A component is active when its loss_weight > 0
+        self.use_kd_feat   = self.kd_feat_weight   > 0
+        self.use_kd_output = self.kd_output_weight > 0
+        if not self.use_kd_feat and not self.use_kd_output:
+            logger.warning(
+                'KDSRModel: both kd_feat_opt and kd_output_opt have '
+                'loss_weight=0 (or are absent). Only pixel_opt will '
+                'contribute to the training loss.'
+            )
+
+        # ------------------------------------------------------------------ #
+        # Feature hooks (only when feature-level KD is active)                #
         # ------------------------------------------------------------------ #
         self._teacher_feat = None
         self._student_feat = None
-        self._register_feature_hooks()
+        if self.use_kd_feat:
+            self._register_feature_hooks()
 
         # ------------------------------------------------------------------ #
-        # Feature projector (student channels → teacher channels)             #
+        # Feature projector — student channels → teacher channels              #
+        # Built only when feature-level KD is active.                         #
         # ------------------------------------------------------------------ #
-        train_opt = opt.get('train', {})
-        student_feat_ch = train_opt.get(
-            'student_feat_channels',
-            opt['network_g'].get('num_feat', 64)
-        )
-        teacher_feat_ch = train_opt.get('teacher_feat_channels', 64)
-
-        self.feat_projector = nn.Conv2d(
-            student_feat_ch, teacher_feat_ch, kernel_size=1, stride=1, padding=0
-        )
-        self.feat_projector = self.model_to_device(self.feat_projector)
-
-        # ------------------------------------------------------------------ #
-        # KD loss weights                                                      #
-        # ------------------------------------------------------------------ #
-        self.kd_feat_weight = train_opt.get(
-            'kd_feat_opt', {}
-        ).get('loss_weight', 1.0)
-        self.kd_output_weight = train_opt.get(
-            'kd_output_opt', {}
-        ).get('loss_weight', 1.0)
+        if self.use_kd_feat:
+            student_feat_ch = train_opt.get(
+                'student_feat_channels',
+                opt['network_g'].get('num_feat', 64)
+            )
+            teacher_feat_ch = train_opt.get('teacher_feat_channels', 64)
+            self.feat_projector = nn.Conv2d(
+                student_feat_ch, teacher_feat_ch, kernel_size=1, stride=1, padding=0
+            )
+            self.feat_projector = self.model_to_device(self.feat_projector)
+        else:
+            self.feat_projector = None
 
         # ------------------------------------------------------------------ #
         # GPU-side degradation pipeline (Stream A: RealESRGAN-style)          #
@@ -283,11 +296,12 @@ class KDSRModel(SRModel):
             self.setup_optimizers()
             self.setup_schedulers()
 
+        feat_str   = f'on(w={self.kd_feat_weight})'   if self.use_kd_feat   else 'off'
+        output_str = f'on(w={self.kd_output_weight})' if self.use_kd_output else 'off'
         logger.info(
             f'KDSRModel | teacher: {teacher_opt["type"]} | '
             f'student: {opt["network_g"]["type"]} | '
-            f'feat_weight={self.kd_feat_weight} | '
-            f'output_weight={self.kd_output_weight} | '
+            f'kd_feat={feat_str} | kd_output={output_str} | '
             f'degradation_pipeline={self._has_degradation}'
         )
 
@@ -684,12 +698,11 @@ class KDSRModel(SRModel):
     # ---------------------------------------------------------------------- #
 
     def setup_optimizers(self):
-        """Set up optimizer for both student and feature projector."""
+        """Set up optimizer for student (and feature projector when feat KD is active)."""
         train_opt = self.opt['train']
-        optim_params = [
-            {'params': self.net_g.parameters()},
-            {'params': self.feat_projector.parameters()},
-        ]
+        optim_params = [{'params': self.net_g.parameters()}]
+        if self.feat_projector is not None:
+            optim_params.append({'params': self.feat_projector.parameters()})
         # Copy to avoid mutating the config dict (which would break resume)
         optim_cfg = {k: v for k, v in train_opt['optim_g'].items() if k != 'type'}
         optim_type = train_opt['optim_g']['type']
@@ -714,71 +727,69 @@ class KDSRModel(SRModel):
                 'the teacher resolution is lower than the student resolution.'
             )
 
-        self.net_teacher.eval()
-        with torch.no_grad():
-            # Pad lq to window_size multiple for transformer teachers
-            teacher = self.net_teacher
-            if hasattr(teacher, 'module'):
-                teacher = teacher.module
-            window_size = getattr(teacher, 'window_size', 1)
-            _, _, h, w = self.lq.shape
-            pad_h = (window_size - h % window_size) % window_size
-            pad_w = (window_size - w % window_size) % window_size
-            lq_padded = F.pad(self.lq, (0, pad_w, 0, pad_h), 'reflect')
-            pseudo_gt_padded = self.net_teacher(lq_padded)
+        # ---- Teacher forward (skipped if both feat/output KD are off) -------
+        pseudo_gt    = None
+        teacher_feat = None
+        _, _, h, w = self.lq.shape
 
-            # Crop padding using teacher_upscale (not student scale)
-            # pseudo_gt_padded: (B, C, (h+pad_h)*teacher_up, (w+pad_w)*teacher_up)
-            # After crop:       (B, C, h*teacher_up, w*teacher_up)
-            _, _, h_out, w_out = pseudo_gt_padded.shape
-            pseudo_gt = pseudo_gt_padded[
-                :, :,
-                :h_out - pad_h * teacher_upscale,
-                :w_out - pad_w * teacher_upscale,
-            ]
+        if self.use_kd_feat or self.use_kd_output:
+            self.net_teacher.eval()
+            with torch.no_grad():
+                # Pad lq to window_size multiple for transformer teachers
+                teacher = self.net_teacher
+                if hasattr(teacher, 'module'):
+                    teacher = teacher.module
+                window_size = getattr(teacher, 'window_size', 1)
+                pad_h = (window_size - h % window_size) % window_size
+                pad_w = (window_size - w % window_size) % window_size
+                lq_padded = F.pad(self.lq, (0, pad_w, 0, pad_h), 'reflect')
+                pseudo_gt_padded = self.net_teacher(lq_padded)
 
-            # Cross-scale: downsample pseudo_gt to student output resolution
-            # E.g. teacher x4 → pseudo_gt (H*4, W*4) → bicubic → (H*3, W*3)
-            if teacher_upscale > student_upscale:
-                pseudo_gt = F.interpolate(
-                    pseudo_gt,
-                    size=(h * student_upscale, w * student_upscale),
-                    mode='bicubic',
-                    align_corners=False,
-                    antialias=True,
-                )
-            # teacher_feat is stored in self._teacher_feat by hook
+                # Crop padding back to original LR-derived HR size
+                _, _, h_out, w_out = pseudo_gt_padded.shape
+                pseudo_gt = pseudo_gt_padded[
+                    :, :,
+                    :h_out - pad_h * teacher_upscale,
+                    :w_out - pad_w * teacher_upscale,
+                ]
 
-        # teacher_feat shape: (B, 64, H_lr+pad_h, W_lr+pad_w) — includes padding
-        # Crop it back to original LR spatial size so we only supervise on real content.
-        teacher_feat = self._teacher_feat[:, :, :h, :w].detach()
+                # Cross-scale: downsample pseudo_gt to student output resolution
+                if teacher_upscale > student_upscale:
+                    pseudo_gt = F.interpolate(
+                        pseudo_gt,
+                        size=(h * student_upscale, w * student_upscale),
+                        mode='bicubic',
+                        align_corners=False,
+                        antialias=True,
+                    )
 
-        # ---- Student: forward pass, capture student features ----------------
+            # teacher_feat captured by hook during the forward above
+            if self.use_kd_feat:
+                # Crop padded feature back to original LR spatial size
+                teacher_feat = self._teacher_feat[:, :, :h, :w].detach()
+
+        # ---- Student: forward pass ------------------------------------------
         self.net_g.train()
         student_out = self.net_g(self.lq)
-        # student_feat shape: (B, student_ch, H_lr, W_lr) without S2D
-        #                     (B, student_ch, H_lr/r, W_lr/r) with S2D
-        student_feat = self._student_feat
 
-        # ---- Feature-level KD loss (FitNet MSE) ----------------------------
-        # Project student channels → teacher channels
-        student_feat_proj = self.feat_projector(student_feat)
+        # ---- Feature-level KD loss (FitNet MSE) — optional ------------------
+        l_kd_feat = torch.zeros(1, device=self.device)
+        if self.use_kd_feat:
+            student_feat_proj = self.feat_projector(self._student_feat)
+            # Align spatial resolution if S2D compresses spatial dims in student
+            if student_feat_proj.shape[2:] != teacher_feat.shape[2:]:
+                student_feat_proj = F.interpolate(
+                    student_feat_proj,
+                    size=teacher_feat.shape[2:],
+                    mode='bilinear',
+                    align_corners=False,
+                )
+            l_kd_feat = F.mse_loss(student_feat_proj, teacher_feat) * self.kd_feat_weight
 
-        # Align spatial resolution: after crop, teacher_feat is (B,64,H_lr,W_lr).
-        # If S2D is active, student_feat_proj is at (H_lr/r, W_lr/r) — upsample
-        # to match teacher resolution so MSE is computed at the same grid.
-        if student_feat_proj.shape[2:] != teacher_feat.shape[2:]:
-            student_feat_proj = F.interpolate(
-                student_feat_proj,
-                size=teacher_feat.shape[2:],
-                mode='bilinear',
-                align_corners=False
-            )
-
-        l_kd_feat = F.mse_loss(student_feat_proj, teacher_feat) * self.kd_feat_weight
-
-        # ---- Output-level KD loss (L1 vs teacher pseudo-GT) ----------------
-        l_kd_out = F.l1_loss(student_out, pseudo_gt) * self.kd_output_weight
+        # ---- Output-level KD loss (L1 vs teacher pseudo-GT) — optional ------
+        l_kd_out = torch.zeros(1, device=self.device)
+        if self.use_kd_output:
+            l_kd_out = F.l1_loss(student_out, pseudo_gt) * self.kd_output_weight
 
         # ---- Optional supervised pixel loss --------------------------------
         # Case 1: standard paired batch → self.gt covers the whole batch.
@@ -820,7 +831,7 @@ class KDSRModel(SRModel):
         # Cache first-sample visuals for TensorBoard (detached, no grad)
         self._vis_lq      = self.lq[:1].detach()
         self._vis_student = student_out[:1].detach()
-        self._vis_teacher = pseudo_gt[:1].detach()
+        self._vis_teacher = pseudo_gt[:1].detach() if pseudo_gt is not None else None
 
     # ---------------------------------------------------------------------- #
     # Validation / Inference overrides (student only)                          #

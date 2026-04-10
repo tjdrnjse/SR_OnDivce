@@ -157,17 +157,34 @@ train:
     loss_weight: 0.5
     reduction: mean
 
-  # ── Feature-level KD loss (FitNet MSE) ───────────────────────────────
-  # Compares student conv_body features (projected) vs teacher
-  # conv_before_upsample features.
-  kd_feat_opt:
-    loss_weight: 1.0    # increase to strengthen feature alignment
+  # ── KD loss configuration ────────────────────────────────────────────
+  # Three modes are available — select by setting loss_weight:
+  #
+  #   Mode A — Output KD only (lightweight, no feature projector built):
+  #     kd_output_opt: { loss_weight: 1.0 }
+  #     # kd_feat_opt: omit entirely OR set loss_weight: 0.0
+  #
+  #   Mode B — Feature KD only (FitNet-style intermediate supervision):
+  #     kd_feat_opt: { loss_weight: 1.0 }
+  #     # kd_output_opt: omit entirely OR set loss_weight: 0.0
+  #
+  #   Mode C — Both combined (default, strongest supervision):
+  #     kd_feat_opt:   { loss_weight: 1.0 }
+  #     kd_output_opt: { loss_weight: 1.0 }
+  #
+  # A component is disabled (and its overhead skipped) when loss_weight=0
+  # or the key is absent.
 
-  # ── Output-level KD loss (L1 vs teacher pseudo-GT) ───────────────────
+  # Feature-level KD: student conv_body → projected → vs teacher conv_before_upsample
+  kd_feat_opt:
+    loss_weight: 1.0
+
+  # Output-level KD: student SR output vs teacher pseudo-GT (L1)
   kd_output_opt:
-    loss_weight: 1.0    # increase to strengthen output alignment
+    loss_weight: 1.0
 
   # ── Channel dimensions for the feature projector ─────────────────────
+  # Required only when kd_feat_opt is active.
   student_feat_channels: 64   # must match network_g.num_feat
   teacher_feat_channels: 64   # fixed: HAT/MambaIRv2 conv_before_upsample = 64
 
