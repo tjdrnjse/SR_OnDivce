@@ -496,12 +496,19 @@ class KDSRModel(SRModel):
            (heterogeneous).  ``stream_id`` encodes which samples belong to
            Stream A (0, RealESRGAN) and Stream B (1, SingleLR).
 
-           For Stream A samples the GT + kernels are extracted and LQ is
-           synthesized on-the-fly via ``_degrade_gt_to_lq``.  For Stream B
-           the pre-loaded ``lq`` tensor is used directly.  The final
-           ``self.lq`` is the concatenation ``[lq_A | lq_B]`` along the
-           batch dimension.  ``self.n_stream_a`` records how many Stream A
-           samples are in the batch so ``optimize_parameters`` can split them.
+           Stream A is further split by ``use_paired_lq`` (set by
+           ``RealESRGANDataset``):
+             - **A-deg** (``use_paired_lq == 0``): HR-only samples — LQ is
+               synthesized on-the-fly via ``_degrade_gt_to_lq``.  Loss: KD +
+               pixel vs USM-sharpened GT.
+             - **A-bp** (``use_paired_lq == 1``): paired LQ is loaded from
+               disk (bypass).  Loss: KD + supervised pixel vs real GT.
+           Stream B (``SingleLRDataset``): pre-loaded LQ only.  Loss: KD only.
+
+           The final ``self.lq`` is concatenated as ``[A-deg | A-bp | B]``.
+           ``self.n_stream_a_deg`` and ``self.n_stream_a_bp`` record the slice
+           sizes so ``optimize_parameters`` can apply the correct loss per
+           segment.
         """
         # ---- Detect mode ---------------------------------------------------
         is_joint = isinstance(data.get('stream_id'), torch.Tensor)
@@ -513,16 +520,17 @@ class KDSRModel(SRModel):
                 self.gt = data['gt'].to(self.device)
             elif hasattr(self, 'gt'):
                 del self.gt
-            self.n_stream_a = 0   # no per-stream split needed
+            self.n_stream_a_deg = 0
+            self.n_stream_a_bp  = 0
             return
 
         # ---- Joint-Batch path ----------------------------------------------
         stream_ids = data['stream_id']          # LongTensor (B,)
+        B_total = len(stream_ids)
         mask_a = (stream_ids == 0)              # boolean mask for Stream A
         mask_b = (stream_ids == 1)              # boolean mask for Stream B
         n_a = int(mask_a.sum().item())
         n_b = int(mask_b.sum().item())
-        self.n_stream_a = n_a
 
         # Helper: extract items at boolean mask positions from a possibly-list value
         def _extract(key, mask):
@@ -536,39 +544,85 @@ class KDSRModel(SRModel):
             items = [val[i] for i in indices if val[i] is not None]
             return torch.stack(items) if items else None
 
-        # ---- Stream B: real LR — used directly -----------------------------
+        # ---- Build per-sub-stream global masks from use_paired_lq ----------
+        # use_paired_lq == 0 → degradation path (A-deg)
+        # use_paired_lq == 1 → paired bypass path (A-bp)
+        # Stream B never has use_paired_lq, so only A indices are relevant.
+        mask_a_deg = torch.zeros(B_total, dtype=torch.bool)
+        mask_a_bp  = torch.zeros(B_total, dtype=torch.bool)
+        n_a_deg = 0
+        n_a_bp  = 0
+
+        if n_a > 0:
+            a_global_idx = mask_a.nonzero(as_tuple=True)[0]  # (n_a,) global indices
+            upl_vals = data.get('use_paired_lq')
+            if isinstance(upl_vals, torch.Tensor):
+                upl_a = upl_vals[mask_a]          # (n_a,)
+            else:
+                # list with possible None entries for Stream B — grab A slots only
+                upl_a = torch.stack(
+                    [upl_vals[i] for i in a_global_idx.tolist()]
+                )                                 # (n_a,)
+
+            local_deg = (upl_a == 0)              # local bool mask within A
+            local_bp  = (upl_a == 1)
+
+            mask_a_deg[a_global_idx[local_deg]] = True
+            mask_a_bp [a_global_idx[local_bp ]] = True
+            n_a_deg = int(local_deg.sum().item())
+            n_a_bp  = int(local_bp.sum().item())
+
+        self.n_stream_a_deg = n_a_deg
+        self.n_stream_a_bp  = n_a_bp
+
+        # ---- Stream A-deg: on-the-fly degradation → LQ + USM-GT ------------
+        lq_a_deg     = None
+        gt_usm_a_deg = None
+        if n_a_deg > 0:
+            if not self._has_degradation:
+                raise RuntimeError(
+                    'Joint-Batch Stream A-deg (RealESRGANDataset degradation) '
+                    'requires a `degradation:` section in the YAML config.'
+                )
+            gt_ad   = _extract('gt',          mask_a_deg).to(self.device)
+            k1_ad   = _extract('kernel1',     mask_a_deg).to(self.device)
+            k2_ad   = _extract('kernel2',     mask_a_deg).to(self.device)
+            sinc_ad = _extract('sinc_kernel', mask_a_deg).to(self.device)
+            lq_a_deg, gt_usm_a_deg = self._degrade_gt_to_lq(
+                gt_ad, k1_ad, k2_ad, sinc_ad
+            )
+
+        # ---- Stream A-bp: paired LQ loaded from disk (supervised) ----------
+        lq_a_bp = None
+        gt_a_bp  = None
+        if n_a_bp > 0:
+            lq_a_bp = _extract('lq', mask_a_bp).to(self.device)
+            gt_a_bp  = _extract('gt', mask_a_bp).to(self.device)
+
+        # ---- Stream B: real LR images — KD only ----------------------------
         lq_b = None
         if n_b > 0:
             lq_b = _extract('lq', mask_b).to(self.device)
 
-        # ---- Stream A: synthesize LQ from HR + kernels ---------------------
-        lq_a = None
-        gt_usm_a = None
-        if n_a > 0:
-            if not self._has_degradation:
-                raise RuntimeError(
-                    'Joint-Batch Stream A (RealESRGANDataset) requires a '
-                    '`degradation:` section in the YAML config.'
-                )
-            gt_a = _extract('gt', mask_a).to(self.device)
-            k1_a = _extract('kernel1', mask_a).to(self.device)
-            k2_a = _extract('kernel2', mask_a).to(self.device)
-            sinc_a = _extract('sinc_kernel', mask_a).to(self.device)
-            lq_a, gt_usm_a = self._degrade_gt_to_lq(gt_a, k1_a, k2_a, sinc_a)
-
-        # ---- Concatenate [A | B] into self.lq ------------------------------
-        parts = [p for p in (lq_a, lq_b) if p is not None]
+        # ---- Concatenate [A-deg | A-bp | B] into self.lq -------------------
+        parts = [p for p in (lq_a_deg, lq_a_bp, lq_b) if p is not None]
         self.lq = torch.cat(parts, dim=0)
 
-        # Store USM-sharpened GT for Stream A pixel loss (optional)
-        if gt_usm_a is not None:
-            self.gt_a = gt_usm_a
-        elif hasattr(self, 'gt_a'):
-            del self.gt_a
+        # ---- Store GT references for optimize_parameters -------------------
+        if gt_usm_a_deg is not None:
+            self.gt_a_deg = gt_usm_a_deg
+        elif hasattr(self, 'gt_a_deg'):
+            del self.gt_a_deg
 
-        # Clear stale unpaired gt
-        if hasattr(self, 'gt'):
-            del self.gt
+        if gt_a_bp is not None:
+            self.gt_a_bp = gt_a_bp
+        elif hasattr(self, 'gt_a_bp'):
+            del self.gt_a_bp
+
+        # Clear stale attributes from previous iterations
+        for _attr in ('gt', 'gt_a'):
+            if hasattr(self, _attr):
+                delattr(self, _attr)
 
     # ---------------------------------------------------------------------- #
     # Hook registration                                                        #
@@ -792,41 +846,62 @@ class KDSRModel(SRModel):
             l_kd_out = F.l1_loss(student_out, pseudo_gt) * self.kd_output_weight
 
         # ---- Optional supervised pixel loss --------------------------------
-        # Case 1: standard paired batch → self.gt covers the whole batch.
-        # Case 2: joint batch → self.gt_a covers only Stream A samples
-        #         (first self.n_stream_a items in student_out / pseudo_gt).
-        l_total = l_kd_feat + l_kd_out
-        l_pix = torch.zeros_like(l_total)
+        # Standard batch:  self.gt covers the whole batch.
+        # Joint batch: three independent slices in [A-deg | A-bp | B] order.
+        #   A-deg → pixel loss vs USM-sharpened GT  (self.gt_a_deg)
+        #   A-bp  → supervised pixel loss vs real GT (self.gt_a_bp)
+        #   B     → no pixel loss (KD only)
+        l_total   = l_kd_feat + l_kd_out
+        l_pix     = torch.zeros(1, device=self.device)
+        l_pix_deg = torch.zeros(1, device=self.device)
+        l_pix_bp  = torch.zeros(1, device=self.device)
         if self.cri_pix is not None:
             if hasattr(self, 'gt'):
-                # Standard paired or KD with explicit GT for all samples
+                # Standard paired batch or non-joint KD with explicit GT
                 l_pix = self.cri_pix(student_out, self.gt)
                 l_total = l_total + l_pix
-            elif hasattr(self, 'gt_a') and self.n_stream_a > 0:
-                # Joint batch: pixel loss only on Stream A slice
-                student_out_a = student_out[:self.n_stream_a]
-                gt_a = self.gt_a
-                # Resize GT to match student output if spatial sizes differ
-                # (happens in cross-scale KD: teacher_up != student_up)
-                if gt_a.shape[2:] != student_out_a.shape[2:]:
-                    gt_a = F.interpolate(
-                        gt_a, size=student_out_a.shape[2:],
-                        mode='bicubic', antialias=True, align_corners=False)
-                l_pix = self.cri_pix(student_out_a, gt_a)
-                l_total = l_total + l_pix
+            else:
+                # Joint batch: apply per-stream pixel losses
+                n_deg = getattr(self, 'n_stream_a_deg', 0)
+                n_bp  = getattr(self, 'n_stream_a_bp',  0)
+
+                # A-deg slice: pixel loss vs USM-sharpened GT
+                if n_deg > 0 and hasattr(self, 'gt_a_deg'):
+                    out_deg = student_out[:n_deg]
+                    gt_deg  = self.gt_a_deg
+                    if gt_deg.shape[2:] != out_deg.shape[2:]:
+                        gt_deg = F.interpolate(
+                            gt_deg, size=out_deg.shape[2:],
+                            mode='bicubic', antialias=True, align_corners=False)
+                    l_pix_deg = self.cri_pix(out_deg, gt_deg)
+
+                # A-bp slice: supervised pixel loss vs paired GT
+                if n_bp > 0 and hasattr(self, 'gt_a_bp'):
+                    out_bp = student_out[n_deg:n_deg + n_bp]
+                    gt_bp  = self.gt_a_bp
+                    if gt_bp.shape[2:] != out_bp.shape[2:]:
+                        gt_bp = F.interpolate(
+                            gt_bp, size=out_bp.shape[2:],
+                            mode='bicubic', antialias=True, align_corners=False)
+                    l_pix_bp = self.cri_pix(out_bp, gt_bp)
+
+                # Stream B: no pixel loss
+                if n_deg > 0 or n_bp > 0:
+                    l_pix = l_pix_deg + l_pix_bp
+                    l_total = l_total + l_pix
 
         l_total.backward()
         self.optimizer_g.step()
 
         # ---- Logging -------------------------------------------------------
-        self.log_dict = self.reduce_loss_dict(
-            OrderedDict(
-                l_kd_feat=l_kd_feat,
-                l_kd_out=l_kd_out,
-                l_pix=l_pix,
-                l_total=l_total,
-            )
-        )
+        self.log_dict = self.reduce_loss_dict(OrderedDict(
+            l_kd_feat=l_kd_feat,
+            l_kd_out=l_kd_out,
+            l_pix=l_pix,
+            l_pix_deg=l_pix_deg,
+            l_pix_bp=l_pix_bp,
+            l_total=l_total,
+        ))
 
         # Cache first-sample visuals for TensorBoard (detached, no grad)
         self._vis_lq      = self.lq[:1].detach()
