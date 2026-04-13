@@ -362,7 +362,7 @@ class KDSRModel(SRModel):
 
     def _build_degradation_pipeline(self):
         """Initialise DiffJPEG and USM-sharpener for Stream A LQ synthesis."""
-        from basicsr.data.degradations import DiffJPEG, USMSharp
+        from basicsr.utils import DiffJPEG, USMSharp
         self.jpeger = DiffJPEG(differentiable=False).to(self.device)
         self.usm_sharpener = USMSharp().to(self.device)
         logger = get_root_logger()
