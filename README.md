@@ -17,9 +17,11 @@ A **turn-key Knowledge Distillation (KD) Super-Resolution** framework built on t
 4. [KD Training](#4-kd-training)
 5. [Joint-Batch KD Training (H100 DDP)](#5-joint-batch-kd-training-h100-ddp)
 6. [Convert to Deployment Weights](#6-convert-to-deployment-weights)
-7. [Final Inference / Test](#7-final-inference--test)
-8. [Teacher Model Standalone Testing (Tiling Inference)](#8-teacher-model-standalone-testing-tiling-inference)
-9. [Architecture Notes](#9-architecture-notes)
+7. [Export to ONNX (NPU Porting)](#7-export-to-onnx-npu-porting)
+8. [Test ONNX Model (NPU Verification)](#8-test-onnx-model-npu-verification)
+9. [Final Inference / Test](#9-final-inference--test)
+10. [Teacher Model Standalone Testing (Tiling Inference)](#10-teacher-model-standalone-testing-tiling-inference)
+11. [Architecture Notes](#12-architecture-notes)
 
 ---
 
@@ -498,7 +500,147 @@ model.eval()
 
 ---
 
-## 7. Final Inference / Test
+## 7. Export to ONNX (NPU Porting)
+
+Use `scripts/export_onnx.py` to convert a teacher model to ONNX format.
+This is intended for **mobile/NPU porting feasibility checks** — the exported
+graph can be submitted to an NPU compiler (e.g. Samsung Exynos, Qualcomm AI)
+to verify operator support before full porting work begins.
+
+> **Note:** Only the `network_t` (teacher) section of the inference YAML is
+> used. `network_g` (student) keys are ignored.
+> MambaIRv2 cannot be exported to ONNX because it relies on CUDA-only
+> `mamba_ssm` kernels. Use the HAT teacher YAML.
+
+### Prerequisites
+
+```bash
+pip install onnx onnxruntime
+```
+
+### Basic usage
+
+```bash
+# Export HAT x3 — input size taken from tile_size in YAML (256x256 by default)
+python scripts/export_onnx.py \
+    --opt options/inference/teacher_hat_x3.yml
+```
+
+Output: `results/onnx/HAT_x3.onnx`
+
+### Full option reference
+
+```bash
+python scripts/export_onnx.py \
+    --opt        options/inference/teacher_hat_x3.yml \
+    --output-dir results/onnx \
+    --filename   hat_sr_x3.onnx \
+    --opset      17 \
+    --input-h    256 \
+    --input-w    256 \
+    --device     cpu
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--opt` | (required) | Path to inference YAML (`options/inference/*.yml`) |
+| `--output-dir` | `results/onnx` | Directory for the `.onnx` file |
+| `--filename` | `<ModelType>_x<scale>.onnx` | Output filename |
+| `--opset` | `17` | ONNX opset version |
+| `--input-h` | `64` | LR input height (fixed at export, must be multiple of 16) |
+| `--input-w` | `64` | LR input width (fixed at export, must be multiple of 16) |
+| `--device` | `cpu` | Device used for tracing (`cpu` recommended) |
+
+### Notes
+
+- **Input shape is fixed** at export time (NPU compilers require static shapes).
+  Default is 64×64. Use `--input-h` / `--input-w` to set the tile size the
+  NPU will actually receive (e.g. 128, 256). Both dimensions must be multiples
+  of `window_size` (16).
+- **Larger-than-training inputs work.** HAT uses local window attention
+  (window_size=16), so attention is computed inside fixed 16×16 windows
+  regardless of total image size. Exporting with 128×128 or 256×256 is valid.
+- A **pretrained checkpoint is not required**. If `path.pretrain_network_t`
+  is missing or the file does not exist, the script exports with random weights
+  (suitable for graph / operator compatibility checks).
+- **`use_checkpoint` (gradient checkpointing) is automatically disabled**
+  before export — this flag is incompatible with `torch.onnx.export`.
+- If `onnx` is installed, `onnx.checker.check_model` is run automatically
+  on the saved file. If `onnxruntime` is installed, you can verify inference:
+
+```python
+import numpy as np
+import onnxruntime as ort
+
+sess = ort.InferenceSession('results/onnx/HAT_x3.onnx',
+                            providers=['CPUExecutionProvider'])
+inp  = np.random.randn(1, 3, 256, 256).astype(np.float32)
+out  = sess.run(None, {'input': inp})
+print(out[0].shape)  # (1, 3, 768, 768) for x3
+```
+
+---
+
+## 8. Test ONNX Model (NPU Verification)
+
+Use `scripts/test_onnx.py` to run SR inference with a converted ONNX file.
+This script is intended for NPU engineers to verify output quality before
+compiling the model for the target device.
+
+### Prerequisites
+
+```bash
+pip install onnxruntime Pillow
+# For GPU inference:
+pip install onnxruntime-gpu Pillow
+```
+
+### Usage
+
+```bash
+# Single image
+python scripts/test_onnx.py \
+    --onnx   results/onnx/HAT_x3.onnx \
+    --input  path/to/lr_image.png \
+    --output results/onnx_test
+
+# Folder of images
+python scripts/test_onnx.py \
+    --onnx   results/onnx/HAT_x3.onnx \
+    --input  datasets/my_lr_images \
+    --output results/onnx_test
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--onnx` | (required) | Path to the `.onnx` model file |
+| `--input` | (required) | Input image file or folder of images |
+| `--output` | `results/onnx_test` | Directory to save output images |
+
+### Output files
+
+| File | Description |
+|------|-------------|
+| `<stem>_sr.png` | Super-resolved output image |
+| `<stem>_input_resized.png` | Resized input (only saved when resize was applied) |
+
+### Resize behaviour
+
+The ONNX model has a fixed expected input size (set at export time, e.g. 64×64).
+
+- If the input image matches that size → inference runs directly.
+- If the input image is a **different size** → it is resized (Lanczos) to the
+  model's expected size before inference, and the resized version is saved
+  alongside the SR output as `<stem>_input_resized.png`.
+
+### Provider selection
+
+GPU (CUDA) is used automatically when `onnxruntime-gpu` is installed and a
+CUDA device is available. Falls back to CPU otherwise.
+
+---
+
+## 9. Final Inference / Test
 
 Edit `options/test/test_KD_RepSR_x4.yml` and set the student checkpoint path:
 
@@ -527,7 +669,7 @@ tile:
 
 ---
 
-## 8. Teacher Model Standalone Testing (Tiling Inference)
+## 10. Teacher Model Standalone Testing (Tiling Inference)
 
 Use `scripts/inference_teacher_tiling.py` to evaluate a Teacher model
 (HAT, MambaIRv2, etc.) **independently** -- without loading the student or
@@ -693,7 +835,7 @@ python scripts/inference_teacher_tiling.py \
 
 ---
 
-## 9. End-to-End Experiment Example (x4 SR, HAT Teacher)
+## 11. End-to-End Experiment Example (x4 SR, HAT Teacher)
 
 아래는 HAT teacher + RepSR student, scale×4, GPU 1장 기준으로 처음부터 끝까지 실행하는 전체 명령어 예시입니다.
 
@@ -805,7 +947,7 @@ python hat/test.py -opt options/test/test_KD_RepSR_x4.yml
 
 ---
 
-## 10. Architecture Notes
+## 12. Architecture Notes
 
 ### RepSR
 
@@ -860,6 +1002,8 @@ Set `type: MambaIRv2` in `network_teacher:` to use it as the teacher.
 | `options/test/test_KD_RepSR_x4.yml` | Test / inference configuration |
 | `scripts/convert_rep_sr.py` | Reparameterization & export script |
 | `scripts/inference_teacher_tiling.py` | Teacher standalone SR with linear-blend tiling |
+| `scripts/export_onnx.py` | Export teacher model to ONNX (fixed spatial size, NPU porting) |
+| `scripts/test_onnx.py` | Run SR inference with a converted ONNX model (NPU verification) |
 | `options/inference/teacher_hat_x3.yml` | Example YAML for HAT x3 teacher inference |
 | `options/inference/teacher_mambairv2_small_x3.yml` | Example YAML for MambaIRv2 Small x3 teacher inference |
 
