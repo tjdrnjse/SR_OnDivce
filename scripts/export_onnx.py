@@ -29,7 +29,6 @@ Notes
 - Gradient checkpointing (use_checkpoint) is automatically disabled.
 - Weights are not required; the script exports with random weights when
   the checkpoint is missing (useful for graph-shape checks).
-- MambaIRv2 uses CUDA-only ``mamba_ssm`` ops and cannot be exported to ONNX.
 """
 
 import argparse
@@ -61,12 +60,6 @@ def build_model(cfg: dict) -> torch.nn.Module:
             'with the teacher architecture parameters.'
         )
     net_type = net_cfg['type']
-    if 'mamba' in net_type.lower():
-        raise RuntimeError(
-            f'Model type "{net_type}" relies on CUDA-only mamba_ssm ops '
-            'and cannot be exported to ONNX.  '
-            'Use the HAT teacher YAML instead.'
-        )
 
     # Apply basicsr torchvision compat shim if present
     try:

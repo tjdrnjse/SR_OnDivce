@@ -1,5 +1,5 @@
 # ============================================================
-# Knowledge Distillation SR Training: RepSR (Student) + HAT/MambaIRv2 (Teacher)
+# Knowledge Distillation SR Training: RepSR (Student) + HAT (Teacher)
 # Scale: x4
 # ============================================================
 
@@ -66,13 +66,10 @@ network_g:
   s2d_factor: 2              # PixelUnshuffle factor when use_space_to_depth=true
 
 # ============================================================
-# Teacher network
-#   teacher_model_type: 'hat' or 'mambairv2'
-#
-#   HAT teacher example (default):
+# Teacher network (HAT)
 # ============================================================
 network_teacher:
-  type: HAT                  # change to 'MambaIRv2' to use MambaIRv2 teacher
+  type: HAT
   upscale: 4
   in_chans: 3
   img_size: 64
@@ -88,24 +85,6 @@ network_teacher:
   mlp_ratio: 2
   upsampler: 'pixelshuffle'
   resi_connection: '1conv'
-
-# ---- MambaIRv2 teacher (uncomment to switch) ----
-# network_teacher:
-#   type: MambaIRv2
-#   upscale: 4
-#   img_size: 64
-#   embed_dim: 60
-#   d_state: 8
-#   depths: [6, 6, 6, 6]
-#   num_heads: [4, 4, 4, 4]
-#   window_size: 16
-#   inner_rank: 32
-#   num_tokens: 64
-#   convffn_kernel_size: 5
-#   mlp_ratio: 2.
-#   img_range: 1.
-#   upsampler: 'pixelshuffle'
-#   resi_connection: '1conv'
 
 # ============================================================
 # Tile settings (used during validation for large images)
@@ -125,7 +104,7 @@ path:
   strict_load_g: true
   resume_state: ~
 
-  # Teacher: REQUIRED – provide the pretrained HAT/MambaIRv2 checkpoint
+  # Teacher: REQUIRED – provide the pretrained HAT checkpoint
   pretrain_network_teacher: ./experiments/pretrained_models/HAT_SRx4_ImageNet-pretrain.pth
   # param key inside the checkpoint file (usually 'params_ema' for HAT)
   # KDSRModel handles both 'params_ema' and 'params' automatically.
@@ -186,7 +165,7 @@ train:
   # ── Channel dimensions for the feature projector ─────────────────────
   # Required only when kd_feat_opt is active.
   student_feat_channels: 64   # must match network_g.num_feat
-  teacher_feat_channels: 64   # fixed: HAT/MambaIRv2 conv_before_upsample = 64
+  teacher_feat_channels: 64   # fixed: HAT conv_before_upsample = 64
 
 # ============================================================
 # Validation settings

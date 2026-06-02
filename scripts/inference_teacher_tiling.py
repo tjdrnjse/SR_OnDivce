@@ -3,7 +3,7 @@ scripts/inference_teacher_tiling.py
 ====================================
 Standalone Teacher SR inference with crop-and-paste tiling.
 
-Supports any Teacher network registered in hat.archs (HAT, MambaIRv2, etc.).
+Supports any Teacher network registered in hat.archs (HAT, etc.).
 Reads a lightweight YAML config -- only ``network_t`` (teacher architecture)
 and ``path.pretrain_network_t`` (teacher weights) are required.
 All ``network_g`` / student keys are silently ignored.

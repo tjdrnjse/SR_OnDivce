@@ -2,7 +2,7 @@
 Knowledge Distillation Super-Resolution Model (KDSRModel).
 
 Implements FitNet-style KD pipeline:
-  - Teacher (HAT or MambaIRv2): frozen, eval-mode, on-the-fly Pseudo-GT
+  - Teacher (HAT): frozen, eval-mode, on-the-fly Pseudo-GT
   - Student (RepSR / HAT-S): trained with Feature-level KD + Output-level KD
 
 Supports **Joint-Batch training** with two data streams:
@@ -631,7 +631,7 @@ class KDSRModel(SRModel):
     def _get_teacher_hook_layer(self):
         """Return the layer in the teacher from which to extract features.
 
-        For HAT and MambaIRv2 the feature extraction point is
+        For HAT the feature extraction point is
         `conv_before_upsample` (output: (B, 64, H, W)).
         Falls back gracefully if the attribute doesn't exist.
         """
